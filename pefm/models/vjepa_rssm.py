@@ -12,15 +12,15 @@ class VJEPARSSMEvaluator(nn.Module):
 
     def forward(self, batch):
         visual_tokens = self.vjepa_adapter(batch["rgb"], batch["group_ids"])
-        real_embed = self.token_aggregator(visual_tokens)
-        initial = self.rssm.initial(real_embed.shape[0])
+        embed = self.token_aggregator(visual_tokens)
+        initial = self.rssm.initial(embed.shape[0])
         post_stoch, deter, post_logits = self.rssm.observe(
-            real_embed, batch["eef"], initial, batch["reset"]
+            embed, batch["eef"], initial, batch["reset"]
         )
         prior_stoch, prior_logits = self.rssm.prior(deter)
         return {
             "visual_tokens": visual_tokens,
-            "real_embed": real_embed,
+            "embed": embed,
             "deter": deter,
             "posterior_stoch": post_stoch,
             "posterior_logits": post_logits,

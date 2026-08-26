@@ -13,7 +13,8 @@ class VJEPAObservationAdapter(nn.Module):
         self.encoder = encoder
         self.input_size = (input_size, input_size) if isinstance(input_size, int) else tuple(input_size)
         self.freeze = freeze
-        self.register_buffer("mean", torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1))
+        # RGB normalization constants expected by V-JEPA calculated on ImageNet dataset
+        self.register_buffer("mean", torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)) 
         self.register_buffer("std", torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1))
         if freeze:
             self.encoder.requires_grad_(False)
@@ -27,8 +28,8 @@ class VJEPAObservationAdapter(nn.Module):
         x = F.interpolate(x, resized, mode="bilinear", align_corners=False)
         top = (resized[0] - self.input_size[0]) // 2
         left = (resized[1] - self.input_size[1]) // 2
-        x = x[:, :, top : top + self.input_size[0], left : left + self.input_size[1]]
-        x = ((x + 1.0) / 2.0).unsqueeze(2).repeat(1, 1, 2, 1, 1)
+        x = x[:, :, top : top + self.input_size[0], left : left + self.input_size[1]] # centre-crop
+        x = ((x + 1.0) / 2.0).unsqueeze(2).repeat(1, 1, 2, 1, 1) # consistent with tubelet_size=2 in jepa encoder
         return (x - self.mean) / self.std
 
     def forward(self, rgb, group_ids):
