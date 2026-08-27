@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from pefm.data import build_evaluator_dataloader
-from pefm.models import RSSM, TokenAggregator, VJEPAObservationAdapter, VJEPARSSMEvaluator
+from pefm.models import DummyVisualPredictor, RSSM, TokenAggregator, VJEPAObservationAdapter, VJEPARSSMEvaluator
 from src.bwm.wan_video_action.data.wan_dataset import RoboTwinUnifiedDataset
 from src.bwm.wan_video_action.utils import load_action_stats
 from src.bwm.wan_video_action.data.operators import LoadCobotAction, create_video_operator
@@ -61,6 +61,7 @@ def test_bwm_vjepa_rssm_flow():
     
     evaluator = VJEPARSSMEvaluator(
         VJEPAObservationAdapter(DummyVJEPA(), input_size=256),
+        DummyVisualPredictor(token_dim=1408, action_dim=14),
         TokenAggregator(token_dim=1408, embed_dim=256, num_heads=2),
         RSSM(cfg.model.rssm, embed_size=256, act_dim=14),
     ).to(device)
@@ -69,11 +70,16 @@ def test_bwm_vjepa_rssm_flow():
     assert batch["rgb"].shape == (cfg.batch_size, 1, 3, 81, 480, 640)
     assert batch["eef"].shape == (cfg.batch_size, 21, 14)
     assert output["visual_tokens"].shape == (cfg.batch_size, 21, 256, 1408)
+    assert output["predicted_visual_tokens"].shape == (cfg.batch_size, 21, 256, 1408)
     assert output["embed"].shape == (cfg.batch_size, 21, 256)
+    assert output["predicted_context"].shape == (cfg.batch_size, 21, 256)
     assert output["posterior_logits"].shape == (cfg.batch_size, 21, 32, 16)
     assert output["prior_logits"].shape == (cfg.batch_size, 21, 32, 16)
-    output["embed"].square().mean().backward()
+    (output["posterior_logits"].square().mean() + output["prior_logits"].square().mean()).backward()
     assert batch["rgb"].grad is not None
+    assert evaluator.context_predictor.action_proj.weight.grad is not None
+    assert next(evaluator.rssm._img_net.parameters()).grad is not None
+    assert next(evaluator.rssm._obs_net.parameters()).grad is not None
     print("test passed")
 
 if __name__ == "__main__":

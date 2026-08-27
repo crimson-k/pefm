@@ -5,11 +5,11 @@ from torch import distributions as torchd
 from src.r2dreamer.rssm import Deter
 
 import src.r2dreamer.distributions as dists
-from src.r2dreamer.networks import BlockLinear, LambdaLayer
+from src.r2dreamer.networks import LambdaLayer
 from src.r2dreamer.tools import rpad, weight_init_
 
 class RSSM(nn.Module):
-    def __init__(self, config, embed_size, act_dim):
+    def __init__(self, config, embed_size, act_dim, context_size=None):
         super().__init__()
         self._stoch = int(config.stoch)
         self._deter = int(config.deter)
@@ -20,6 +20,7 @@ class RSSM(nn.Module):
         self._initial = str(config.initial)
         self._device = torch.device(config.device)
         self._act_dim = act_dim
+        self._context_size = embed_size if context_size is None else context_size
         self._obs_layers = int(config.obs_layers)
         self._img_layers = int(config.img_layers)
         self._dyn_layers = int(config.dyn_layers)
@@ -50,7 +51,7 @@ class RSSM(nn.Module):
         )
 
         self._img_net = nn.Sequential() # prior network
-        inp_dim = self._deter
+        inp_dim = self._deter + self._context_size
         for i in range(self._img_layers):
             self._img_net.add_module(f"img_net_{i}", nn.Linear(inp_dim, self._hidden, bias=True))
             self._img_net.add_module(f"img_net_n_{i}", nn.RMSNorm(self._hidden, eps=1e-04, dtype=torch.float32))
@@ -70,60 +71,42 @@ class RSSM(nn.Module):
         stoch = torch.zeros(batch_size, self._stoch, self._discrete, dtype=torch.float32, device=self._device)
         return stoch, deter
 
-    def observe(self, embed, action, initial, reset):
-        """Posterior rollout using observations."""
-        # (B, T, E), (B, T, A), ((B, S, K), (B, D)) (B, T)
-        L = action.shape[1]
-        stoch, deter = initial
-        stochs, deters, logits = [], [], []
-        for i in range(L):
-            # (B, S, K), (B, D), (B, S, K)
-            stoch, deter, logit = self.obs_step(stoch, deter, action[:, i], embed[:, i], reset[:, i])
-            stochs.append(stoch)
+    def observe(self, embed, action, context, initial, reset):
+        """Roll out a shared recurrent state with prior and posterior branches."""
+        post_stoch, deter = initial
+        posts, deters, post_logits, priors, prior_logits = [], [], [], [], []
+        for i in range(action.shape[1]):
+            deter = self.recurrent(post_stoch, deter, action[:, i], reset[:, i])
+            prior_stoch, prior_logit = self.prior(deter, context[:, i])
+            post_stoch, post_logit = self.posterior(deter, embed[:, i])
+            posts.append(post_stoch)
             deters.append(deter)
-            logits.append(logit)
-        # (B, T, S, K), (B, T, D), (B, T, S, K)
-        stochs = torch.stack(stochs, dim=1)
-        deters = torch.stack(deters, dim=1)
-        logits = torch.stack(logits, dim=1)
-        return stochs, deters, logits
+            post_logits.append(post_logit)
+            priors.append(prior_stoch)
+            prior_logits.append(prior_logit)
+        return tuple(torch.stack(items, dim=1) for items in (
+            posts, deters, post_logits, priors, prior_logits
+        ))
 
-    def obs_step(self, stoch, deter, prev_action, embed, reset):
-        """Single posterior step."""
-        # (B, S, K), (B, D), (B, A), (B, E), (B,)
+    def recurrent(self, stoch, deter, transition_action, reset):
+        """previous posterior state + transition action -> current deter."""
         stoch = torch.where(rpad(reset, stoch.dim() - int(reset.dim())), torch.zeros_like(stoch), stoch)
         deter = torch.where(rpad(reset, deter.dim() - int(reset.dim())), torch.zeros_like(deter), deter)
-        prev_action = torch.where(
-            rpad(reset, prev_action.dim() - int(reset.dim())), torch.zeros_like(prev_action), prev_action
+        transition_action = torch.where(
+            rpad(reset, transition_action.dim() - int(reset.dim())),
+            torch.zeros_like(transition_action), transition_action,
         )
+        return self._deter_net(stoch, deter, transition_action)
 
-        # Deterministic transition then posterior logits conditioned on embed.
-        # (B, D)
-        deter = self._deter_net(stoch, deter, prev_action)
-        # (B, D + E)
-        x = torch.cat([deter, embed], dim=-1)
-        # (B, S, K)
-        logit = self._obs_net(x)
-
-        # Sample discrete stochastic state via straight-through Gumbel-Softmax.
-        # (B, S, K)
+    def posterior(self, deter, embed):
+        """current deter + real observation embedding -> posterior."""
+        logit = self._obs_net(torch.cat([deter, embed], dim=-1))
         stoch = self.get_dist(logit).rsample()
-        return stoch, deter, logit
+        return stoch, logit
 
-    def img_step(self, stoch, deter, prev_action):
-        """Single prior step (no observation)."""
-
-        # (B, D)
-        deter = self._deter_net(stoch, deter, prev_action)
-        # (B, S, K)
-        stoch, _ = self.prior(deter)
-        return stoch, deter
-
-    def prior(self, deter):
-        """Compute prior distribution parameters and sample stoch."""
-
-        # (B, S, K)
-        logit = self._img_net(deter)
+    def prior(self, deter, context):
+        """current deter + predicted visual context -> prior."""
+        logit = self._img_net(torch.cat([deter, context], dim=-1))
         stoch = self.get_dist(logit).rsample()
         return stoch, logit
 
