@@ -1,0 +1,9 @@
+[submodule "third_party/bwm"]
+	path = third_party/bwm
+	url = https://github.com/crimson-k/boundless-world-model
+[submodule "third_party/r2dreamer"]
+	path = third_party/r2dreamer
+	url = https://github.com/crimson-k/r2dreamer
+[submodule "third_party/vjepa2"]
+	path = third_party/vjepa2
+	url = https://github.com/crimson-k/vjepa2
