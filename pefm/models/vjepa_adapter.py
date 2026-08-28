@@ -4,7 +4,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-
 class VJEPAObservationAdapter(nn.Module):
     """Apply a supplied V-JEPA encoder frame-wise and keep spatial tokens."""
 
@@ -32,10 +31,11 @@ class VJEPAObservationAdapter(nn.Module):
         x = ((x + 1.0) / 2.0).unsqueeze(2).repeat(1, 1, 2, 1, 1) # consistent with tubelet_size=2 in jepa encoder
         return (x - self.mean) / self.std
 
-    def forward(self, rgb, group_ids):
+    def forward(self, rgb, group_ids=None):
         if rgb.ndim != 6:
             raise ValueError(f"Expected RGB [B,V,C,F,H,W], got {tuple(rgb.shape)}")
         b, views, _, frames, _, _ = rgb.shape
+        # (B*V*F, C, T, H, W) -> (B*V*F, C, 2, H, W)
         clips = self._prepare_frames(rgb)
         if self.freeze:
             self.encoder.eval()
@@ -45,6 +45,8 @@ class VJEPAObservationAdapter(nn.Module):
 
         tokens = tokens.reshape(b, views, frames, tokens.shape[-2], tokens.shape[-1])
         tokens = tokens.permute(0, 2, 1, 3, 4).flatten(2, 3)  # [B,F,V*S,D]
+        if group_ids is None:
+            return tokens
         ids = group_ids[0] if group_ids.ndim == 2 else group_ids
         grouped = tokens.new_zeros((b, int(ids[-1]) + 1, tokens.shape[2], tokens.shape[3]))
         grouped.index_add_(1, ids, tokens)

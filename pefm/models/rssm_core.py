@@ -92,6 +92,7 @@ class RSSM(nn.Module):
         """previous posterior state + transition action -> current deter."""
         stoch = torch.where(rpad(reset, stoch.dim() - int(reset.dim())), torch.zeros_like(stoch), stoch)
         deter = torch.where(rpad(reset, deter.dim() - int(reset.dim())), torch.zeros_like(deter), deter)
+        #TODO: transition action should be delta
         transition_action = torch.where(
             rpad(reset, transition_action.dim() - int(reset.dim())),
             torch.zeros_like(transition_action), transition_action,
