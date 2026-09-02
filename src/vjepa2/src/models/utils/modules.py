@@ -245,6 +245,9 @@ class ACRoPEAttention(nn.Module):
             k = merge_(k, action_k)
             v = merge_(v, action_v)
 
+        # RoPE computes in float32; SDPA requires q, k, and v to share a dtype.
+        q, k = q.to(v.dtype), k.to(v.dtype)
+
         if attn_mask is not None or self.use_sdpa:
             with torch.backends.cuda.sdp_kernel():
                 x = F.scaled_dot_product_attention(

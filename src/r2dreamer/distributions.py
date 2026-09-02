@@ -30,7 +30,7 @@ class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
 
     def rsample(self, sample_shape=(), temperature=1.0):
         # (..., K)
-        return F.gumbel_softmax(self.logits, tau=temperature, hard=True, dim=-1)
+        return self.probs
 
     def sample(self, **kwargs):
         raise NotImplementedError

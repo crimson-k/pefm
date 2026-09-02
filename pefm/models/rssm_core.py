@@ -66,9 +66,13 @@ class RSSM(nn.Module):
 
     def initial(self, batch_size):
         """Return an initial latent state."""
+        parameter = next(self.parameters())
         # (B, D), (B, S, K)
-        deter = torch.zeros(batch_size, self._deter, dtype=torch.float32, device=self._device)
-        stoch = torch.zeros(batch_size, self._stoch, self._discrete, dtype=torch.float32, device=self._device)
+        deter = torch.zeros(batch_size, self._deter, dtype=parameter.dtype, device=parameter.device)
+        stoch = torch.zeros(
+            batch_size, self._stoch, self._discrete,
+            dtype=parameter.dtype, device=parameter.device,
+        )
         return stoch, deter
 
     def observe(self, embed, action, context, initial, reset):
@@ -102,13 +106,13 @@ class RSSM(nn.Module):
     def posterior(self, deter, embed):
         """current deter + real observation embedding -> posterior."""
         logit = self._obs_net(torch.cat([deter, embed], dim=-1))
-        stoch = self.get_dist(logit).rsample()
+        stoch = self.get_dist(logit).base_dist.probs.to(logit.dtype)
         return stoch, logit
 
     def prior(self, deter, context):
         """current deter + predicted visual context -> prior."""
         logit = self._img_net(torch.cat([deter, context], dim=-1))
-        stoch = self.get_dist(logit).rsample()
+        stoch = self.get_dist(logit).base_dist.probs.to(logit.dtype)
         return stoch, logit
 
     def get_feat(self, stoch, deter):

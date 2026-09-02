@@ -14,6 +14,8 @@ weight_decay: 0.01
 max_grad_norm: 0.5
 max_batches: 0
 
+eval_mode: True
+
 predictor_warmup: False
 
 rssm_model_size: "src/r2dreamer/configs/model/size12M.yaml"
