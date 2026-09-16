@@ -1,11 +1,11 @@
-dataset: "/data1/fangxuebin/boundless-world-model/converted_dataset_task1"
+dataset: "/data1/fangxuebin/boundless-world-model/converted_dataset_bwm_6tasks"
 vjepa_checkpoint: "/data1/fangxuebin/models/vjepa2/vjepa2-ac-vitg.pt"
-output: "outputs/evaluator/epoch_100"
-resume: /data1/fangxuebin/pefm/outputs/evaluator/epoch_100/epoch_0100.pt
-init_checkpoint: null
-checkpoint_every: 100
+output: "outputs/evaluator/soft_6tasks_epoch_100"
+resume: null
+init_checkpoint: /data1/fangxuebin/pefm/outputs/evaluator/warmup_epoch_50/epoch_0050.pt
+checkpoint_every: 50
 device: "cuda:0"
-epochs: 1000
+epochs: 100
 batch_size: 4
 workers: 0
 seed: 42
@@ -14,7 +14,7 @@ weight_decay: 0.01
 max_grad_norm: 0.5
 max_batches: 0
 
-eval_mode: True
+eval_mode: False
 
 predictor_warmup: False
 

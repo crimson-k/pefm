@@ -5,11 +5,11 @@ from torch import nn
 
 from pefm.data import build_evaluator_dataloader
 from pefm.models import RSSM, TokenAggregator, VJEPAObservationAdapter, VJEPARSSMEvaluator
-from src.bwm.wan_video_action.data.wan_dataset import RoboTwinUnifiedDataset
-from src.bwm.wan_video_action.utils import load_action_stats
-from src.bwm.wan_video_action.data.operators import LoadCobotAction, create_video_operator
-from src.vjepa2.src.models.vision_transformer import VisionTransformer
-from src.vjepa2.src.models.ac_predictor import VisionTransformerPredictorAC
+from ..src.bwm.wan_video_action.data.wan_dataset import RoboTwinUnifiedDataset
+from ..src.bwm.wan_video_action.utils import load_action_stats
+from ..src.bwm.wan_video_action.data.operators import LoadCobotAction, create_video_operator
+from ..src.vjepa2.src.models.vision_transformer import VisionTransformer
+from ..src.vjepa2.src.models.ac_predictor import VisionTransformerPredictorAC
 
 def test_bwm_vjepa_rssm_flow():
     base = OmegaConf.load("src/r2dreamer/configs/model/_base_.yaml")

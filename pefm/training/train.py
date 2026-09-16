@@ -10,8 +10,10 @@ from accelerate import Accelerator
 from omegaconf import OmegaConf
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pefm.training.config.parser import merge_yaml_and_args
+from pefm.training.graceful_exit import GracefulExit
 from pefm.data import build_evaluator_dataloader
 from pefm.models import build_evaluator
+from pefm import export_frozen_evaluator
 from src.bwm.wan_video_action.data.operators import LoadCobotAction, create_video_operator
 from src.bwm.wan_video_action.data.wan_dataset import RoboTwinUnifiedDataset
 from src.bwm.wan_video_action.utils import load_action_stats, set_global_seed
@@ -37,7 +39,7 @@ def make_loader(cfg, metadata_name, first_episode, last_episode, shuffle):
         dataset, 4, cfg.batch_size, shuffle=shuffle, num_workers=cfg.workers,
     )
 
-def run_epoch(model, loader, cfg, optimizer, epoch, split, accelerator):
+def run_epoch(model, loader, cfg, optimizer, epoch, split, accelerator, stop=None):
     training = optimizer is not None
     model.train(training)
     core = accelerator.unwrap_model(model)
@@ -71,14 +73,19 @@ def run_epoch(model, loader, cfg, optimizer, epoch, split, accelerator):
         values = " ".join(f"{name}={float(value):.5f}" for name, value in logged.items())
         if accelerator.is_main_process:
             print(f"[{split}] epoch={epoch} batch={batch_id} grad_norm={grad_norm:.4f} {values}", flush=True)
+        if stop is not None:
+            stop.batch = count
+            if stop.sync():
+                break
         if cfg.max_batches and count >= cfg.max_batches:
             break
     return {name: value / count for name, value in totals.items()}
 
-def save_state(path, model, optimizer, cfg, epoch):
+def save_state(path, model, optimizer, cfg, epoch, **progress):
     state = {
         "model": model.state_dict(), "optimizer": optimizer.state_dict(),
         "epoch": epoch, "config": OmegaConf.to_container(cfg, resolve=True), "seed": int(cfg.seed),
+        **progress,
     }
     temporary = str(path) + ".tmp"
     torch.save(state, temporary)
@@ -91,9 +98,13 @@ def save_checkpoint(output, model, optimizer, cfg, epoch):
     if numbered.exists():
         numbered.unlink()
     os.link(latest, numbered)  # Hard link: versioned checkpoint without duplicating 7.7 GB.
+    if epoch == cfg.epochs:
+        frozen = export_frozen_evaluator(numbered, output / "frozen_evaluator.pt")
+        print(f"[checkpoint] frozen evaluator: {frozen}", flush=True)
 
 def main():
     accelerator = Accelerator()
+    stop = GracefulExit(accelerator)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None, help="Path to a YAML config file. CLI args override YAML config.")
     args = parser.parse_args()
@@ -143,9 +154,15 @@ def main():
         model, optimizer, train_loader, val_loader,
     )
     for epoch in range(start_epoch, cfg.epochs):
-        train_losses = run_epoch(model, train_loader, cfg, optimizer, epoch, "train", accelerator)
+        train_losses = run_epoch(model, train_loader, cfg, optimizer, epoch, "train", accelerator, stop)
+        if stop.requested:
+            stop.save(output, model, optimizer, cfg, epoch, "train", save_state)
+            break
         with torch.no_grad():
-            val_losses = run_epoch(model, val_loader, cfg, None, epoch, "val", accelerator)
+            val_losses = run_epoch(model, val_loader, cfg, None, epoch, "val", accelerator, stop)
+        if stop.requested:
+            stop.save(output, model, optimizer, cfg, epoch, "val", save_state)
+            break
         if accelerator.is_main_process:
             print(f"[epoch] {epoch} train={train_losses} val={val_losses}", flush=True)
             completed = epoch + 1
