@@ -1,17 +1,16 @@
 """BWM RGB to grouped V-JEPA observation embeddings."""
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 class VJEPAObservationAdapter(nn.Module):
     """Apply a supplied V-JEPA encoder frame-wise and keep spatial tokens."""
 
-    def __init__(self, encoder: nn.Module, input_size=224, freeze=True):
+    def __init__(self, encoder: nn.Module, freeze=True, normalize=True):
         super().__init__()
         self.encoder = encoder
-        self.input_size = (input_size, input_size) if isinstance(input_size, int) else tuple(input_size)
         self.freeze = freeze
+        self.normalize = normalize
         # RGB normalization constants expected by V-JEPA calculated on ImageNet dataset
         self.register_buffer("mean", torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)) 
         self.register_buffer("std", torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1))
@@ -22,14 +21,11 @@ class VJEPAObservationAdapter(nn.Module):
         # BWM: [B,V,C,F,H,W] in [-1,1]. V-JEPA AC: one frame repeated for a 2-frame tubelet.
         b, v, c, frames, height, width = rgb.shape
         x = rgb.permute(0, 1, 3, 2, 4, 5).reshape(b * v * frames, c, height, width)
-        scale = max(self.input_size[0] / height, self.input_size[1] / width)
-        resized = (round(height * scale), round(width * scale))
-        x = F.interpolate(x, resized, mode="bilinear", align_corners=False)
-        top = (resized[0] - self.input_size[0]) // 2
-        left = (resized[1] - self.input_size[1]) // 2
-        x = x[:, :, top : top + self.input_size[0], left : left + self.input_size[1]] # centre-crop
-        x = ((x + 1.0) / 2.0).unsqueeze(2).repeat(1, 1, 2, 1, 1) # consistent with tubelet_size=2 in jepa encoder
-        return (x - self.mean) / self.std
+        x = x.unsqueeze(2).repeat(1, 1, 2, 1, 1) # consistent with tubelet_size=2 in jepa encoder
+        if self.normalize:
+            x = (x + 1.0) / 2.0
+            x = (x - self.mean) / self.std
+        return x
 
     def forward(self, rgb, group_ids=None):
         if rgb.ndim != 6:
@@ -39,6 +35,9 @@ class VJEPAObservationAdapter(nn.Module):
         clips = self._prepare_frames(rgb)
         if self.freeze:
             self.encoder.eval()
+        encoder_parameter = next(self.encoder.parameters(), None)
+        if encoder_parameter is not None:
+            clips = clips.to(device=encoder_parameter.device, dtype=encoder_parameter.dtype)
         tokens = self.encoder(clips)
         if isinstance(tokens, (list, tuple)):
             tokens = tokens[-1]
@@ -48,10 +47,41 @@ class VJEPAObservationAdapter(nn.Module):
         if group_ids is None:
             return tokens
         ids = group_ids[0] if group_ids.ndim == 2 else group_ids
+        ids = ids.to(tokens.device)
         grouped = tokens.new_zeros((b, int(ids[-1]) + 1, tokens.shape[2], tokens.shape[3]))
         grouped.index_add_(1, ids, tokens)
         counts = torch.bincount(ids).to(tokens).view(1, -1, 1, 1)
         return grouped / counts
+
+
+def row_major_token_grid(tokens, spatial_grid=(30, 40)):
+    """Restore ``[B,F,V*H*W,D]`` tokens to ``[B,F,V,H,W,D]``."""
+    if tokens.ndim != 4:
+        raise ValueError(f"Expected [B,F,V*S,D] tokens, got {tuple(tokens.shape)}")
+    height, width = spatial_grid
+    spatial_tokens = height * width
+    if tokens.shape[2] % spatial_tokens:
+        raise ValueError(
+            f"Token count {tokens.shape[2]} is not divisible by spatial grid {spatial_grid}"
+        )
+    views = tokens.shape[2] // spatial_tokens
+    return tokens.reshape(tokens.shape[0], tokens.shape[1], views, height, width, tokens.shape[3])
+
+
+def align_row_major_tokens(tokens, source_grid=(30, 40), target_grid=(15, 20)):
+    """Average source-grid blocks while preserving row-major spatial alignment."""
+    source_height, source_width = source_grid
+    target_height, target_width = target_grid
+    if source_height % target_height or source_width % target_width:
+        raise ValueError(f"Non-integer grid mapping: {source_grid} -> {target_grid}")
+    grid = row_major_token_grid(tokens, source_grid)
+    scale_height = source_height // target_height
+    scale_width = source_width // target_width
+    grid = grid.reshape(
+        tokens.shape[0], tokens.shape[1], grid.shape[2], target_height, scale_height,
+        target_width, scale_width, tokens.shape[3],
+    )
+    return grid.mean(dim=(4, 6))
 
 
 class TokenAggregator(nn.Module):

@@ -9,7 +9,7 @@ from src.r2dreamer.networks import LambdaLayer
 from src.r2dreamer.tools import rpad, weight_init_
 
 class RSSM(nn.Module):
-    def __init__(self, config, embed_size, act_dim, context_size=None):
+    def __init__(self, config, embed_size, act_dim):
         super().__init__()
         self._stoch = int(config.stoch)
         self._deter = int(config.deter)
@@ -20,7 +20,6 @@ class RSSM(nn.Module):
         self._initial = str(config.initial)
         self._device = torch.device(config.device)
         self._act_dim = act_dim
-        self._context_size = embed_size if context_size is None else context_size
         self._obs_layers = int(config.obs_layers)
         self._img_layers = int(config.img_layers)
         self._dyn_layers = int(config.dyn_layers)
@@ -51,7 +50,7 @@ class RSSM(nn.Module):
         )
 
         self._img_net = nn.Sequential() # prior network
-        inp_dim = self._deter + self._context_size
+        inp_dim = self._deter
         for i in range(self._img_layers):
             self._img_net.add_module(f"img_net_{i}", nn.Linear(inp_dim, self._hidden, bias=True))
             self._img_net.add_module(f"img_net_n_{i}", nn.RMSNorm(self._hidden, eps=1e-04, dtype=torch.float32))
@@ -75,13 +74,13 @@ class RSSM(nn.Module):
         )
         return stoch, deter
 
-    def observe(self, embed, action, context, initial, reset):
+    def observe(self, embed, action, initial, reset):
         """Roll out a shared recurrent state with prior and posterior branches."""
         post_stoch, deter = initial
         posts, deters, post_logits, priors, prior_logits = [], [], [], [], []
         for i in range(action.shape[1]):
             deter = self.recurrent(post_stoch, deter, action[:, i], reset[:, i])
-            prior_stoch, prior_logit = self.prior(deter, context[:, i])
+            prior_stoch, prior_logit = self.prior(deter)
             post_stoch, post_logit = self.posterior(deter, embed[:, i])
             posts.append(post_stoch)
             deters.append(deter)
@@ -96,7 +95,6 @@ class RSSM(nn.Module):
         """previous posterior state + transition action -> current deter."""
         stoch = torch.where(rpad(reset, stoch.dim() - int(reset.dim())), torch.zeros_like(stoch), stoch)
         deter = torch.where(rpad(reset, deter.dim() - int(reset.dim())), torch.zeros_like(deter), deter)
-        #TODO: transition action should be delta
         transition_action = torch.where(
             rpad(reset, transition_action.dim() - int(reset.dim())),
             torch.zeros_like(transition_action), transition_action,
@@ -109,9 +107,9 @@ class RSSM(nn.Module):
         stoch = self.get_dist(logit).base_dist.probs.to(logit.dtype)
         return stoch, logit
 
-    def prior(self, deter, context):
-        """current deter + predicted visual context -> prior."""
-        logit = self._img_net(torch.cat([deter, context], dim=-1))
+    def prior(self, deter):
+        """Predict the interaction state from history and action alone."""
+        logit = self._img_net(deter)
         stoch = self.get_dist(logit).base_dist.probs.to(logit.dtype)
         return stoch, logit
 

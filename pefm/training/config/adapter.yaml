@@ -1,0 +1,20 @@
+# PEFM-side Stage 2 Phase-B Adapter training.
+# BWM hidden capture is supplied through train_manifest/valid_manifest.
+teacher_bundle: null
+train_manifest: null
+valid_manifest: null
+output: "outputs/adapter"
+device: "cuda"
+dtype: "bfloat16"
+dit_dim: 3072
+selected_block: 20
+target_grid: [15, 20]
+num_views: 1
+history_groups: 3
+epochs: 10
+lr: 1e-4
+weight_decay: 0.01
+noise_sampling: null
+token_scale: 1.0
+embedding_scale: 1.0
+posterior_scale: 1.0

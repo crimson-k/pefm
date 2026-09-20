@@ -1,4 +1,4 @@
-"""Minimal positive-pair training loop for the Stage-1 evaluator."""
+"""Train the V-JEPA RSSM teacher used by the later latent/Main branch."""
 
 import argparse
 import json
@@ -10,13 +10,69 @@ from accelerate import Accelerator
 from omegaconf import OmegaConf
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pefm.training.config.parser import merge_yaml_and_args
-from pefm.training.graceful_exit import GracefulExit
-from pefm.data import build_evaluator_dataloader
+from pefm.utils.graceful_exit import GracefulExit
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
+from dataloader import RawCobotAction, build_RGB_dataloader
 from pefm.models import build_evaluator
 from pefm import export_frozen_evaluator
-from src.bwm.wan_video_action.data.operators import LoadCobotAction, create_video_operator
+from src.bwm.wan_video_action.data.operators import create_video_operator
 from src.bwm.wan_video_action.data.wan_dataset import RoboTwinUnifiedDataset
 from src.bwm.wan_video_action.utils import load_action_stats, set_global_seed
+
+NUM_FRAMES = 81
+HISTORY_FRAMES = 9
+TIME_DIVISION_FACTOR = 4
+
+
+def teacher_contract(cfg):
+    return {
+        "state_space": "shared_rssm_v1",
+        "categorical_shape": [int(cfg.model.rssm.stoch), int(cfg.model.rssm.discrete)],
+        "num_frames": NUM_FRAMES,
+        "history_frames": HISTORY_FRAMES,
+        "time_groups": 1 + (NUM_FRAMES - 1) // TIME_DIVISION_FACTOR,
+        "vjepa_encoder_frozen": True,
+    }
+
+
+def check_teacher_contract(checkpoint, cfg):
+    contract = checkpoint.get("semantic_teacher")
+    if contract is None:
+        return
+    expected = teacher_contract(cfg)
+    for key, value in expected.items():
+        assert contract.get(key) == value, (
+            f"Teacher contract mismatch for {key}: "
+            f"checkpoint={contract.get(key)!r}, expected={value!r}"
+        )
+
+
+def loss_reset_for_teacher(batch):
+    """Keep the RSSM rollout intact but supervise only future groups."""
+    reset = batch["reset"].clone()
+    group_ids = batch["group_ids"]
+    history_groups = int(group_ids[0, HISTORY_FRAMES - 1].item()) + 1
+    reset[:, :history_groups] = True
+    return reset
+
+
+def mask_teacher_losses(output, losses, reset):
+    """Apply the future-only mask to the reconstruction term as well."""
+    valid = (~reset).to(output["embed"])
+    target_embed = output["embed"].detach()
+    reconstruction_error = (
+        output["posterior_reconstruction"] - target_embed
+    ).square().mean(-1)
+    losses["posterior_reconstruction"] = (
+        reconstruction_error * valid
+    ).sum() / valid.sum().clamp_min(1)
+    losses["total"] = (
+        losses["posterior_reconstruction"]
+        + losses["prior_prediction"]
+        + losses["kl"]
+    )
+    return losses
+
 
 def make_loader(cfg, metadata_name, first_episode, last_episode, shuffle):
     metadata_path = Path(cfg.dataset) / metadata_name
@@ -25,18 +81,18 @@ def make_loader(cfg, metadata_name, first_episode, last_episode, shuffle):
     indices = [
         i for i, row in enumerate(rows)
         if first_episode <= int(row.get("source_episode_index", row["episode_index"])) <= last_episode
-        and int(row["end_frame"]) - int(row.get("start_frame", 0)) + 1 >= 81
+        and int(row["end_frame"]) - int(row.get("start_frame", 0)) + 1 >= NUM_FRAMES
     ]
     assert indices, f"No episodes {first_episode}-{last_episode} in {metadata_path}"
     dataset = RoboTwinUnifiedDataset(
         base_path=cfg.dataset, metadata_path=str(metadata_path), sample_indices=indices,
-        main_data_operator=create_video_operator(base_path=cfg.dataset, num_frames=81),
-        special_operator_map={"action": LoadCobotAction(
+        main_data_operator=create_video_operator(base_path=cfg.dataset, num_frames=NUM_FRAMES),
+        special_operator_map={"action": RawCobotAction(
             base_path=cfg.dataset, stat=load_action_stats(f"{cfg.dataset}/stat.json"),
         )},
     )
-    return build_evaluator_dataloader(
-        dataset, 4, cfg.batch_size, shuffle=shuffle, num_workers=cfg.workers,
+    return build_RGB_dataloader(
+        dataset, TIME_DIVISION_FACTOR, cfg.batch_size, shuffle=shuffle, num_workers=cfg.workers,
     )
 
 def run_epoch(model, loader, cfg, optimizer, epoch, split, accelerator, stop=None):
@@ -49,20 +105,16 @@ def run_epoch(model, loader, cfg, optimizer, epoch, split, accelerator, stop=Non
         if training: optimizer.zero_grad()
         with torch.set_grad_enabled(training):
             output = model(batch)
+            loss_reset = loss_reset_for_teacher(batch)
             losses = core.compute_loss(
-                output, batch["reset"], cfg.model.kl_free,
+                output, loss_reset, cfg.model.kl_free,
                 cfg.model.loss_scales.dyn, cfg.model.loss_scales.rep,
             )
+            losses = mask_teacher_losses(output, losses, loss_reset)
         grad_norm = 0.0
-        if training and not cfg.predictor_warmup:
+        if training:
             accelerator.backward(losses["total"])
             grad_norm = float(accelerator.clip_grad_norm_(model.parameters(), cfg.max_grad_norm))
-            optimizer.step()
-        elif training and cfg.predictor_warmup:
-            accelerator.backward(losses["token_prediction"])
-            grad_norm = float(accelerator.clip_grad_norm_(
-                [parameter for parameter in core.context_predictor.parameters() if parameter.requires_grad],
-                cfg.max_grad_norm))
             optimizer.step()
         names = list(losses)
         reduced = accelerator.reduce(torch.stack([losses[name].detach() for name in names]), "mean")
@@ -82,9 +134,12 @@ def run_epoch(model, loader, cfg, optimizer, epoch, split, accelerator, stop=Non
     return {name: value / count for name, value in totals.items()}
 
 def save_state(path, model, optimizer, cfg, epoch, **progress):
+    resolved_config = OmegaConf.to_container(cfg, resolve=True)
+    resolved_config["semantic_teacher"] = teacher_contract(cfg)
     state = {
         "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-        "epoch": epoch, "config": OmegaConf.to_container(cfg, resolve=True), "seed": int(cfg.seed),
+        "epoch": epoch, "config": resolved_config, "seed": int(cfg.seed),
+        "semantic_teacher": teacher_contract(cfg),
         **progress,
     }
     temporary = str(path) + ".tmp"
@@ -122,6 +177,7 @@ def main():
         saved.init_checkpoint = None
         saved.checkpoint_every = cfg.checkpoint_every
         cfg = saved
+    check_teacher_contract(resume or {}, cfg)
     assert cfg.checkpoint_every > 0, "checkpoint_every must be positive"
     cfg.device = str(accelerator.device)
     cfg.model.rssm.device = cfg.device
@@ -134,17 +190,19 @@ def main():
     train_loader = make_loader(cfg, "metadata_train.jsonl", 0, 39, True)
     val_loader = make_loader(cfg, "metadata_test.jsonl", 40, 49, False)
     model = build_evaluator(cfg, cfg.vjepa_checkpoint)
+    # The V-JEPA encoder defines the observation semantics.  It is always
+    # frozen; the RSSM checkpoint produced here is the teacher state space
+    # that a later latent/Main branch must reuse.
+    model.vjepa_adapter.encoder.requires_grad_(False)
     if cfg.init_checkpoint:
         initialized = torch.load(cfg.init_checkpoint, map_location="cpu", weights_only=False)
+        check_teacher_contract(initialized, cfg)
         model.load_state_dict(initialized["model"])
         del initialized
     for name in cfg.get("freeze", []):
         model.get_submodule(name).requires_grad_(False)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    if cfg.predictor_warmup:
-        optimizer = torch.optim.AdamW([parameter for parameter in model.context_predictor.parameters() if parameter.requires_grad], lr=cfg.lr, weight_decay=cfg.weight_decay)
-    else:
-        optimizer = torch.optim.AdamW(parameters, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    optimizer = torch.optim.AdamW(parameters, lr=cfg.lr, weight_decay=cfg.weight_decay)
     start_epoch = 0
     if resume:
         model.load_state_dict(resume["model"])
@@ -154,6 +212,8 @@ def main():
         model, optimizer, train_loader, val_loader,
     )
     for epoch in range(start_epoch, cfg.epochs):
+        if epoch >= int(cfg.get("freeze_aggregator_epoch", cfg.epochs + 1)):
+            accelerator.unwrap_model(model).token_aggregator.requires_grad_(False)
         train_losses = run_epoch(model, train_loader, cfg, optimizer, epoch, "train", accelerator, stop)
         if stop.requested:
             stop.save(output, model, optimizer, cfg, epoch, "train", save_state)

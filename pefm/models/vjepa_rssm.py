@@ -3,42 +3,37 @@
 import torch
 from torch import nn
 
+from .vjepa_adapter import align_row_major_tokens
+
+
 class VJEPARSSMEvaluator(nn.Module):
-    def __init__(self, vjepa_adapter, context_predictor, token_aggregator, rssm):
+    def __init__(self, vjepa_adapter, token_aggregator, rssm,
+                 rgb_grid=(30, 40), aligned_grid=(15, 20)):
         super().__init__()
         self.vjepa_adapter = vjepa_adapter
-        self.context_predictor = context_predictor
         self.token_aggregator = token_aggregator
         self.rssm = rssm
+        self.rgb_grid = tuple(rgb_grid)
+        self.aligned_grid = tuple(aligned_grid)
         embed_size = token_aggregator.queries.shape[-1]
         self.posterior_reconstruction_head = nn.Linear(rssm.feat_size, embed_size)
         self.prior_prediction_head = nn.Linear(rssm.feat_size, embed_size)
 
-    def forward(self, batch):
-        visual_tokens = self.vjepa_adapter(batch["rgb"], batch["group_ids"])
-        actions = batch["eef"][:, 1:] - batch["eef"][:, :-1]
-        states = batch["eef"][:, :-1]
-        b, t, hw, n = visual_tokens.shape
-        source_tokens = visual_tokens[:, :-1].flatten(1, 2)
-        predicted = self.context_predictor(source_tokens, actions=actions, states=states)
-        predicted = predicted.reshape(b, t-1, hw, n)
-        predicted_visual_tokens = torch.cat([torch.zeros_like(predicted[:, :1]), predicted], 1)
-        embed = self.token_aggregator(visual_tokens)
-        predicted_context = self.token_aggregator(predicted_visual_tokens)
+    def _run_rssm(self, embed, actions, reset):
+        parameter = next(self.rssm.parameters())
+        embed = embed.to(device=parameter.device, dtype=parameter.dtype)
+        actions = actions.to(device=parameter.device, dtype=parameter.dtype)
+        reset = reset.to(device=parameter.device, dtype=torch.bool)
         initial = self.rssm.initial(embed.shape[0])
-        actions = torch.cat([torch.zeros_like(actions[:, :1]), actions], 1)
         post_stoch, deter, post_logits, prior_stoch, prior_logits = self.rssm.observe(
-            embed, actions, predicted_context, initial, batch["reset"]
+            embed, actions, initial, reset
         )
         posterior_reconstruction = self.posterior_reconstruction_head(
             self.rssm.get_feat(post_stoch, deter)
         )
         prior_prediction = self.prior_prediction_head(self.rssm.get_feat(prior_stoch, deter))
         return {
-            "visual_tokens": visual_tokens,
-            "predicted_visual_tokens": predicted_visual_tokens,
             "embed": embed,
-            "predicted_context": predicted_context,
             "deter": deter,
             "posterior_stoch": post_stoch,
             "posterior_logits": post_logits,
@@ -48,6 +43,32 @@ class VJEPARSSMEvaluator(nn.Module):
             "prior_prediction": prior_prediction,
         }
 
+    def forward_embeddings(self, embed, actions, reset):
+        """Run RSSM inference from precomputed per-step embeddings.
+
+        This is the entry point for DiT hidden observations. ``embed`` is
+        ``[B,T,E]`` and uses the same action/reset alignment as the RGB path.
+        """
+        if embed.ndim != 3 or actions.ndim != 3 or reset.ndim != 2:
+            raise ValueError(
+                f"Expected embed [B,T,E], actions [B,T,A], reset [B,T]; "
+                f"got {tuple(embed.shape)}, {tuple(actions.shape)}, {tuple(reset.shape)}"
+            )
+        if embed.shape[:2] != actions.shape[:2] or embed.shape[:2] != reset.shape:
+            raise ValueError("embed, actions, and reset must have the same B,T dimensions")
+        return self._run_rssm(embed, actions, reset)
+
+    def forward(self, batch):
+        visual_tokens = self.vjepa_adapter(batch["rgb"], batch["group_ids"])
+        visual_grid = align_row_major_tokens(
+            visual_tokens, self.rgb_grid, self.aligned_grid
+        )
+        visual_tokens = visual_grid.flatten(2, 4).contiguous()
+        embed = self.token_aggregator(visual_tokens)
+        output = self._run_rssm(embed, batch["action_delta"], batch["reset"])
+        output.update({"visual_tokens": visual_tokens, "visual_grid": visual_grid, "embed": embed})
+        return output
+
     @staticmethod
     def _masked_mean(value, valid):
         valid = valid.to(value)
@@ -56,10 +77,8 @@ class VJEPARSSMEvaluator(nn.Module):
     def compute_loss(self, output, reset, free_nats=1.0, dyn_scale=1.0, rep_scale=0.1):
         """Positive-pair losses; reset positions have no prediction target."""
         valid = ~reset
-        target_tokens = output["visual_tokens"].detach()
         target_embed = output["embed"].detach()
 
-        token_error = (output["predicted_visual_tokens"] - target_tokens).abs().mean((-1, -2))
         reconstruction_error = (output["posterior_reconstruction"] - target_embed).square().mean(-1)
         prediction_error = (output["prior_prediction"] - target_embed).square().mean(-1)
         dyn_loss, rep_loss = self.rssm.kl_loss(
@@ -67,7 +86,6 @@ class VJEPARSSMEvaluator(nn.Module):
         )
 
         losses = {
-            "token_prediction": self._masked_mean(token_error, valid),
             "posterior_reconstruction": reconstruction_error.mean(),
             "prior_prediction": self._masked_mean(prediction_error, valid),
             "kl_dynamics": self._masked_mean(dyn_loss, valid),
@@ -75,8 +93,7 @@ class VJEPARSSMEvaluator(nn.Module):
         }
         losses["kl"] = dyn_scale * losses["kl_dynamics"] + rep_scale * losses["kl_representation"]
         losses["total"] = (
-            losses["token_prediction"]
-            + losses["posterior_reconstruction"]
+            losses["posterior_reconstruction"]
             + losses["prior_prediction"]
             + losses["kl"]
         )

@@ -2,7 +2,7 @@ dataset: "/data1/fangxuebin/boundless-world-model/converted_dataset_bwm_6tasks"
 vjepa_checkpoint: "/data1/fangxuebin/models/vjepa2/vjepa2-ac-vitg.pt"
 output: "outputs/evaluator/soft_6tasks_epoch_100"
 resume: null
-init_checkpoint: /data1/fangxuebin/pefm/outputs/evaluator/warmup_epoch_50/epoch_0050.pt
+init_checkpoint: null
 checkpoint_every: 50
 device: "cuda:0"
 epochs: 100
@@ -13,17 +13,14 @@ lr: 4e-5
 weight_decay: 0.01
 max_grad_norm: 0.5
 max_batches: 0
+freeze_aggregator_epoch: 10
 
 eval_mode: False
-
-predictor_warmup: False
 
 rssm_model_size: "src/r2dreamer/configs/model/size12M.yaml"
 
 freeze:
   - "vjepa_adapter.encoder"
-  - "context_predictor.extrinsics_encoder"
-  # - "context_predictor"
   # - "token_aggregator"
   # - "rssm"
   # - "posterior_reconstruction_head"

@@ -20,6 +20,7 @@ def export_frozen_evaluator(checkpoint_path, bundle_path):
         "config": checkpoint["config"],
         "epoch": int(checkpoint["epoch"]),
         "seed": int(checkpoint["seed"]),
+        "semantic_teacher": checkpoint.get("semantic_teacher"),
     }
     path = Path(bundle_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,6 +37,9 @@ def load_frozen_evaluator(bundle_path, device, dtype):
         raise ValueError(f"Unsupported PEFM bundle format: {bundle.get('format')!r}")
 
     cfg = OmegaConf.create(bundle["config"])
+    contract = bundle.get("semantic_teacher") or cfg.get("semantic_teacher")
+    if contract is not None and int(contract.get("time_groups", 0)) != 21:
+        raise ValueError(f"Stage 2 requires a 21-group Teacher, got {contract!r}")
     cfg.device = "cpu"
     cfg.model.rssm.device = "cpu"
     evaluator = build_evaluator(cfg)

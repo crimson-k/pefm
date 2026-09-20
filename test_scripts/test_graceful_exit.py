@@ -19,21 +19,20 @@ from pefm.utils.graceful_exit import GracefulExit
 class TinyEvaluator(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.context_predictor = torch.nn.Linear(1, 1)
+        self.layer = torch.nn.Linear(1, 1)
 
     def forward(self, batch):
-        return self.context_predictor(batch["x"])
+        return self.layer(batch["x"])
 
     def compute_loss(self, output, *args):
         loss = output.square().mean()
-        return {"total": loss, "token_prediction": loss}
+        return {"total": loss}
 
 
 def main():
     accelerator = Accelerator(cpu=True)
     cfg = OmegaConf.create({
         "device": "cpu", "seed": 42, "max_grad_norm": 1.0, "max_batches": 0,
-        "predictor_warmup": False,
         "model": {"kl_free": 1.0, "loss_scales": {"dyn": 1.0, "rep": 0.1}},
     })
     loader = [{"x": torch.ones(2, 1), "reset": torch.zeros(2, dtype=torch.bool)}] * 3
@@ -45,13 +44,12 @@ def main():
                      and node.name in ("run_epoch", "save_state")]
         scope = {"torch": torch, "os": os, "OmegaConf": OmegaConf}
         exec(compile(tree, str(path), "exec"), scope)
-        for split, warmup in (("train", False), ("train", True), ("val", False)):
-            cfg.predictor_warmup = warmup
+        for split in ("train", "val"):
             stop = GracefulExit(accelerator)
             model = TinyEvaluator()
             optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
             model, optimizer = accelerator.prepare(model, optimizer)
-            before = accelerator.unwrap_model(model).context_predictor.weight.detach().clone()
+            before = accelerator.unwrap_model(model).layer.weight.detach().clone()
 
             def send_signal(*args):
                 # Only the last rank receives USR1, during the first forward.
@@ -64,7 +62,7 @@ def main():
             hook.remove()
             assert stop.requested and stop.batch == 1
             core = accelerator.unwrap_model(model)
-            assert torch.equal(before, core.context_predictor.weight) == (split == "val")
+            assert torch.equal(before, core.layer.weight) == (split == "val")
             with tempfile.TemporaryDirectory() as directory:
                 output = Path(directory)
                 stop.save(output, model, optimizer, cfg, 2, split, scope["save_state"])
