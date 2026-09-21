@@ -6,6 +6,7 @@ valid_manifest: null
 output: "outputs/adapter"
 device: "cuda"
 dtype: "bfloat16"
+mixed_precision: "bf16"
 dit_dim: 3072
 selected_block: 20
 target_grid: [15, 20]

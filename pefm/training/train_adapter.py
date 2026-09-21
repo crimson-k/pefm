@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import torch
+from accelerate import Accelerator
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
@@ -81,6 +82,7 @@ def _scalar_metrics(result):
 def run_adapter_epoch(
     distiller, loader, device, optimizer=None,
     token_scale=0.0, embedding_scale=1.0, posterior_scale=1.0,
+    accelerator=None,
 ):
     """Run one Phase-B epoch and return averaged loss/diagnostic scalars."""
     training = optimizer is not None
@@ -106,11 +108,23 @@ def run_adapter_epoch(
             )
         losses = result["adapter"]
         if training:
-            losses["total"].backward()
+            if accelerator is None:
+                losses["total"].backward()
+            else:
+                accelerator.backward(losses["total"])
             optimizer.step()
-        for name, value in _scalar_metrics(losses).items():
-            totals[name] = totals.get(name, 0.0) + value
-        count += 1
+        scalar_metrics = _scalar_metrics(losses)
+        if accelerator is None:
+            for name, value in scalar_metrics.items():
+                totals[name] = totals.get(name, 0.0) + value
+            count += 1
+        else:
+            names = list(scalar_metrics)
+            values = torch.stack([losses[name].detach().float() for name in names]).unsqueeze(0)
+            gathered = accelerator.gather_for_metrics(values)
+            for name, value in zip(names, gathered.sum(0).cpu().tolist()):
+                totals[name] = totals.get(name, 0.0) + value
+            count += gathered.shape[0]
     if not count:
         raise ValueError("Stage 2 Adapter epoch received no batches")
     return {name: value / count for name, value in totals.items()}
@@ -148,6 +162,7 @@ def train_adapter(
     embedding_scale=1.0,
     posterior_scale=1.0,
     prior_metric_scale=1.0,
+    accelerator=None,
 ):
     """Train and export the best Adapter using a caller-provided DataLoader."""
     if tuple(target_grid) != (15, 20) or int(num_views) != 1:
@@ -165,8 +180,20 @@ def train_adapter(
     optimizer = torch.optim.AdamW(
         adapter.parameters(), lr=lr, weight_decay=weight_decay,
     )
+    if accelerator is not None:
+        if valid_loader is None:
+            distiller, optimizer, train_loader = accelerator.prepare(
+                distiller, optimizer, train_loader,
+            )
+        else:
+            distiller, optimizer, train_loader, valid_loader = accelerator.prepare(
+                distiller, optimizer, train_loader, valid_loader,
+            )
     output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
+    if accelerator is None or accelerator.is_main_process:
+        output.mkdir(parents=True, exist_ok=True)
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
     best_score = None
     best_path = output / "best_adapter.pt"
     for epoch in range(1, int(epochs) + 1):
@@ -175,6 +202,7 @@ def train_adapter(
             token_scale=token_scale,
             embedding_scale=embedding_scale,
             posterior_scale=posterior_scale,
+            accelerator=accelerator,
         )
         valid_metrics = None
         if valid_loader is not None:
@@ -184,32 +212,47 @@ def train_adapter(
                     token_scale=token_scale,
                     embedding_scale=embedding_scale,
                     posterior_scale=posterior_scale,
+                    accelerator=accelerator,
                 )
         metrics = valid_metrics or train_metrics
         score = metrics["correct_cosine"] - max(
             metrics["shuffled_spatial_cosine"], metrics["shuffled_time_view_cosine"],
         ) + prior_metric_scale * metrics["next_prior_cosine"]
+        message = f"[adapter] epoch={epoch} train={train_metrics} valid={valid_metrics} score={score:.6f}"
+        if accelerator is None:
+            print(message, flush=True)
+        else:
+            accelerator.print(message)
         path = output / f"adapter_epoch_{epoch:04d}.pt"
-        export_stage2_adapter(
-            path,
-            adapter,
-            selected_block=selected_block,
-            teacher_contract=teacher_contract,
-            noise_sampling=noise_sampling,
-            epoch=epoch,
-            metrics={"train": train_metrics, "valid": valid_metrics},
+        exported_adapter = (
+            accelerator.unwrap_model(distiller).adapter
+            if accelerator is not None else adapter
         )
-        if best_score is None or score > best_score:
-            best_score = score
+        is_main_process = accelerator is None or accelerator.is_main_process
+        if is_main_process:
             export_stage2_adapter(
-                best_path,
-                adapter,
+                path,
+                exported_adapter,
                 selected_block=selected_block,
                 teacher_contract=teacher_contract,
                 noise_sampling=noise_sampling,
                 epoch=epoch,
                 metrics={"train": train_metrics, "valid": valid_metrics},
             )
+        if best_score is None or score > best_score:
+            best_score = score
+            if is_main_process:
+                export_stage2_adapter(
+                    best_path,
+                    exported_adapter,
+                    selected_block=selected_block,
+                    teacher_contract=teacher_contract,
+                    noise_sampling=noise_sampling,
+                    epoch=epoch,
+                    metrics={"train": train_metrics, "valid": valid_metrics},
+                )
+        if accelerator is not None:
+            accelerator.wait_for_everyone()
     return best_path
 
 
@@ -236,6 +279,7 @@ def main():
     parser.add_argument("--embedding-scale", type=float, default=None)
     parser.add_argument("--posterior-scale", type=float, default=None)
     parser.add_argument("--prior-metric-scale", type=float, default=None)
+    parser.add_argument("--mixed-precision", choices=("no", "fp16", "bf16"), default=None)
     args = parser.parse_args()
     config = {}
     if args.config:
@@ -249,6 +293,7 @@ def main():
         "num_views": 1, "hidden_dim": None, "noise_sampling": None,
         "token_scale": 0.0, "embedding_scale": 1.0, "posterior_scale": 1.0,
         "prior_metric_scale": 1.0,
+        "mixed_precision": "bf16",
     }
     for key, value in defaults.items():
         values.setdefault(key, value)
@@ -261,6 +306,7 @@ def main():
     if args.noise_sampling:
         values["noise_sampling"] = json.loads(args.noise_sampling)
     dtype = getattr(torch, values["dtype"])
+    accelerator = Accelerator(mixed_precision=values["mixed_precision"])
     train_loader = DataLoader(
         HiddenBatchDataset(values["train_manifest"]), batch_size=1, shuffle=True,
         collate_fn=lambda items: items[0],
@@ -277,7 +323,7 @@ def main():
         values["output"],
         dit_dim=int(values["dit_dim"]),
         selected_block=int(values["selected_block"]),
-        device=values["device"],
+        device=accelerator.device,
         dtype=dtype,
         epochs=int(values["epochs"]),
         lr=float(values["lr"]),
@@ -291,7 +337,11 @@ def main():
         posterior_scale=float(values["posterior_scale"]),
         prior_metric_scale=float(values["prior_metric_scale"]),
         valid_loader=valid_loader,
+        accelerator=accelerator,
     )
+    accelerator.wait_for_everyone()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
