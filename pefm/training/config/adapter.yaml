@@ -15,6 +15,7 @@ epochs: 10
 lr: 1e-4
 weight_decay: 0.01
 noise_sampling: null
-token_scale: 1.0
+token_scale: 0.0
 embedding_scale: 1.0
 posterior_scale: 1.0
+prior_metric_scale: 1.0

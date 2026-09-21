@@ -14,7 +14,11 @@ from pefm.utils.graceful_exit import GracefulExit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
 from dataloader import RawCobotAction, build_RGB_dataloader
 from pefm.models import build_evaluator
-from pefm import export_frozen_evaluator
+from pefm.export import (
+    check_teacher_contract,
+    export_frozen_evaluator,
+    teacher_contract,
+)
 from src.bwm.wan_video_action.data.operators import create_video_operator
 from src.bwm.wan_video_action.data.wan_dataset import RoboTwinUnifiedDataset
 from src.bwm.wan_video_action.utils import load_action_stats, set_global_seed
@@ -22,29 +26,6 @@ from src.bwm.wan_video_action.utils import load_action_stats, set_global_seed
 NUM_FRAMES = 81
 HISTORY_FRAMES = 9
 TIME_DIVISION_FACTOR = 4
-
-
-def teacher_contract(cfg):
-    return {
-        "state_space": "shared_rssm_v1",
-        "categorical_shape": [int(cfg.model.rssm.stoch), int(cfg.model.rssm.discrete)],
-        "num_frames": NUM_FRAMES,
-        "history_frames": HISTORY_FRAMES,
-        "time_groups": 1 + (NUM_FRAMES - 1) // TIME_DIVISION_FACTOR,
-        "vjepa_encoder_frozen": True,
-    }
-
-
-def check_teacher_contract(checkpoint, cfg):
-    contract = checkpoint.get("semantic_teacher")
-    if contract is None:
-        return
-    expected = teacher_contract(cfg)
-    for key, value in expected.items():
-        assert contract.get(key) == value, (
-            f"Teacher contract mismatch for {key}: "
-            f"checkpoint={contract.get(key)!r}, expected={value!r}"
-        )
 
 
 def loss_reset_for_teacher(batch):
@@ -171,13 +152,19 @@ def main():
     cfg.model.rssm.initial = "zeros"
     resume = torch.load(cfg.resume, map_location="cpu", weights_only=False) if cfg.resume else None
     assert not (resume and cfg.init_checkpoint), "Use resume or init_checkpoint, not both"
+    if cfg.init_checkpoint:
+        raise ValueError(
+            "The Stage 2 Teacher must train RSSM, TokenAggregator and heads from "
+            "scratch; init_checkpoint is disabled"
+        )
+    if resume:
+        check_teacher_contract(resume, cfg)
     if resume:
         saved = OmegaConf.create(resume["config"])
         saved.device, saved.epochs, saved.resume, saved.seed = cfg.device, cfg.epochs, cfg.resume, resume["seed"]
         saved.init_checkpoint = None
         saved.checkpoint_every = cfg.checkpoint_every
         cfg = saved
-    check_teacher_contract(resume or {}, cfg)
     assert cfg.checkpoint_every > 0, "checkpoint_every must be positive"
     cfg.device = str(accelerator.device)
     cfg.model.rssm.device = cfg.device
@@ -194,11 +181,6 @@ def main():
     # frozen; the RSSM checkpoint produced here is the teacher state space
     # that a later latent/Main branch must reuse.
     model.vjepa_adapter.encoder.requires_grad_(False)
-    if cfg.init_checkpoint:
-        initialized = torch.load(cfg.init_checkpoint, map_location="cpu", weights_only=False)
-        check_teacher_contract(initialized, cfg)
-        model.load_state_dict(initialized["model"])
-        del initialized
     for name in cfg.get("freeze", []):
         model.get_submodule(name).requires_grad_(False)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]

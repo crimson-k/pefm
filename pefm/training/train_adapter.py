@@ -80,7 +80,7 @@ def _scalar_metrics(result):
 
 def run_adapter_epoch(
     distiller, loader, device, optimizer=None,
-    token_scale=1.0, embedding_scale=1.0, posterior_scale=1.0,
+    token_scale=0.0, embedding_scale=1.0, posterior_scale=1.0,
 ):
     """Run one Phase-B epoch and return averaged loss/diagnostic scalars."""
     training = optimizer is not None
@@ -144,9 +144,10 @@ def train_adapter(
     target_grid=(15, 20),
     num_views=1,
     hidden_dim=None,
-    token_scale=1.0,
+    token_scale=0.0,
     embedding_scale=1.0,
     posterior_scale=1.0,
+    prior_metric_scale=1.0,
 ):
     """Train and export the best Adapter using a caller-provided DataLoader."""
     if tuple(target_grid) != (15, 20) or int(num_views) != 1:
@@ -187,7 +188,7 @@ def train_adapter(
         metrics = valid_metrics or train_metrics
         score = metrics["correct_cosine"] - max(
             metrics["shuffled_spatial_cosine"], metrics["shuffled_time_view_cosine"],
-        )
+        ) + prior_metric_scale * metrics["next_prior_cosine"]
         path = output / f"adapter_epoch_{epoch:04d}.pt"
         export_stage2_adapter(
             path,
@@ -234,6 +235,7 @@ def main():
     parser.add_argument("--token-scale", type=float, default=None)
     parser.add_argument("--embedding-scale", type=float, default=None)
     parser.add_argument("--posterior-scale", type=float, default=None)
+    parser.add_argument("--prior-metric-scale", type=float, default=None)
     args = parser.parse_args()
     config = {}
     if args.config:
@@ -245,7 +247,8 @@ def main():
         "device": "cuda", "dtype": "bfloat16", "epochs": 1,
         "lr": 1e-4, "weight_decay": 0.01, "target_grid": [15, 20],
         "num_views": 1, "hidden_dim": None, "noise_sampling": None,
-        "token_scale": 1.0, "embedding_scale": 1.0, "posterior_scale": 1.0,
+        "token_scale": 0.0, "embedding_scale": 1.0, "posterior_scale": 1.0,
+        "prior_metric_scale": 1.0,
     }
     for key, value in defaults.items():
         values.setdefault(key, value)
@@ -286,6 +289,7 @@ def main():
         token_scale=float(values["token_scale"]),
         embedding_scale=float(values["embedding_scale"]),
         posterior_scale=float(values["posterior_scale"]),
+        prior_metric_scale=float(values["prior_metric_scale"]),
         valid_loader=valid_loader,
     )
 

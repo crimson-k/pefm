@@ -196,7 +196,7 @@ class TemporalSemanticDistillation(nn.Module):
         return self
 
     def forward(self, hidden, dit_grid, teacher_batch, actions=None, reset=None,
-                num_views=None, valid_len=None, phase="bwm", token_scale=1.0,
+                num_views=None, valid_len=None, phase="bwm", token_scale=0.0,
                 embedding_scale=1.0, posterior_scale=1.0):
         """Run the complete RGB-target/DiT-hidden processing path.
 
@@ -228,10 +228,10 @@ class TemporalSemanticDistillation(nn.Module):
                 embedding_scale, posterior_scale,
             )
         if phase in ("bwm", "both"):
-            result["prior"] = self.prior_loss(generated_output, teacher_output)
+            result["prior"] = self.prior_outputs(generated_output, teacher_output)
         return result
 
-    def adapter_loss(self, generated_output, teacher_output, token_scale=1.0,
+    def adapter_loss(self, generated_output, teacher_output, token_scale=0.0,
                      embedding_scale=1.0, posterior_scale=1.0):
         """Calibrate the Adapter on all 18 future groups (logical steps 3..20)."""
         start = self.history_groups
@@ -249,6 +249,13 @@ class TemporalSemanticDistillation(nn.Module):
             teacher_output["posterior_logits"][:, start:],
             generated_output["posterior_logits"][:, start:],
         ).mean()
+        # This is a validation-only next-step prior diagnostic.  The actual
+        # prior KL is deliberately left to BWM in Phase C.
+        prior_target = teacher_output["posterior_logits"][:, start + 1:].detach().float()
+        prior_prediction = generated_output["prior_logits"][:, start + 1:].float()
+        next_prior_cosine = F.cosine_similarity(
+            prior_prediction.flatten(1), prior_target.flatten(1), dim=-1,
+        ).mean().detach()
         total = (
             token_scale * token_mse
             + embedding_scale * embedding_mse
@@ -259,18 +266,26 @@ class TemporalSemanticDistillation(nn.Module):
             **token_metrics,
             "embedding_mse": embedding_mse,
             "posterior_kl": posterior_kl,
+            "next_prior_cosine": next_prior_cosine,
             "total": total,
         }
 
-    def prior_loss(self, generated_output, teacher_output):
-        """Compare p^G_4..20 with q^GT_4..20, without free-nats clipping."""
+    def prior_outputs(self, generated_output, teacher_output):
+        """Return p^G_4..20 and q^GT_4..20 for BWM-side KL computation."""
         start = self.history_groups + 1
-        student = generated_output["prior_logits"][:, start:]
-        target = teacher_output["posterior_logits"][:, start:]
-        expected = teacher_output["posterior_logits"].shape[1] - start
-        if expected != VALID_PRIOR_STEPS:
+        generated_prior = generated_output["prior_logits"][:, start:]
+        gt_posterior = teacher_output["posterior_logits"][:, start:].detach()
+        if generated_prior.shape[1] != VALID_PRIOR_STEPS:
             raise ValueError(
-                f"Stage 2 expects 21 groups and 17 valid transitions, got {expected}"
+                f"Stage 2 expects 21 groups and 17 valid transitions, got "
+                f"{generated_prior.shape[1]}"
             )
-        per_step = categorical_kl(target, student)
-        return {"prior_kl": per_step.mean(), "prior_kl_per_step": per_step}
+        if gt_posterior.shape != generated_prior.shape:
+            raise ValueError(
+                "GT posterior and Generated prior must have the same [B,17,S,K] shape, "
+                f"got {tuple(gt_posterior.shape)} and {tuple(generated_prior.shape)}"
+            )
+        return {
+            "gt_posterior": gt_posterior,
+            "generated_prior": generated_prior,
+        }
