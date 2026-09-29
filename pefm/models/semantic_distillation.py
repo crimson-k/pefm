@@ -46,9 +46,11 @@ class TemporalSemanticDistillation(nn.Module):
 
     def __init__(self, teacher, adapter, history_groups=3):
         super().__init__()
-        if tuple(adapter.target_grid) != TARGET_GRID or int(adapter.num_views) != 1:
+        teacher_grid = tuple(getattr(teacher, "aligned_grid", TARGET_GRID))
+        if tuple(adapter.target_grid) != teacher_grid or int(adapter.num_views) != 1:
             raise ValueError(
-                "PEFM Stage 2 currently supports only a single view mapped to 15x20"
+                "PEFM Stage 2 requires one view and an Adapter grid matching "
+                f"the Teacher grid {teacher_grid}"
             )
         aggregator = getattr(teacher, "token_aggregator", None)
         if aggregator is None:
@@ -64,6 +66,7 @@ class TemporalSemanticDistillation(nn.Module):
             )
         self.teacher = teacher.requires_grad_(False).eval()
         self.adapter = adapter
+        self.target_grid = tuple(adapter.target_grid)
         self.history_groups = int(history_groups)
         if self.history_groups != HISTORY_GROUPS:
             raise ValueError(f"Stage 2 requires history_groups={HISTORY_GROUPS}")
@@ -79,10 +82,12 @@ class TemporalSemanticDistillation(nn.Module):
         output = self.teacher(batch)
         grid = output.get("visual_grid")
         if grid is None or grid.ndim != 6 or tuple(grid.shape[:5]) != (
-            batch["rgb"].shape[0], TIME_GROUPS, 1, TARGET_GRID[0], TARGET_GRID[1]
+            batch["rgb"].shape[0], TIME_GROUPS, 1,
+            self.target_grid[0], self.target_grid[1],
         ):
             raise ValueError(
-                "Teacher visual_grid must have shape [B,21,1,15,20,D], got "
+                "Teacher visual_grid has an unexpected shape for target grid "
+                f"{self.target_grid}, got "
                 f"{None if grid is None else tuple(grid.shape)}"
             )
         embed = output.get("embed")

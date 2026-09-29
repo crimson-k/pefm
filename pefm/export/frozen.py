@@ -35,6 +35,8 @@ def teacher_contract(cfg):
             "num_heads": 4,
             "num_queries": 4,
         },
+        "rgb_grid": [int(value) for value in cfg.get("rgb_grid", [15, 20])],
+        "aligned_grid": [int(value) for value in cfg.get("aligned_grid", [15, 20])],
         "rssm": {
             key: (float(getattr(rssm, key)) if key == "unimix_ratio"
                   else str(getattr(rssm, key)) if key in ("act", "initial")
@@ -102,6 +104,11 @@ def load_frozen_evaluator(bundle_path, device, dtype):
     del bundle, state
     evaluator.to(device=device, dtype=dtype)
     evaluator.rssm._device = torch.device(device)
+    action_delta_stats = cfg.get("action_delta_stats")
+    evaluator.action_delta_stats = (
+        OmegaConf.to_container(action_delta_stats, resolve=True)
+        if action_delta_stats is not None else None
+    )
     evaluator.requires_grad_(False)
     evaluator.eval()
     return evaluator

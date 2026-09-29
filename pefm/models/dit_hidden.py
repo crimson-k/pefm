@@ -3,22 +3,26 @@
 from torch import nn
 
 
-def _pool_grid(grid, target_grid):
-    """Area-pool an integer DiT grid without interpolating across coordinates."""
+def _align_grid(grid, target_grid):
+    """Match integer-scaled DiT cells to the Teacher grid without mixing views."""
     if grid.ndim != 4:
         raise ValueError(f"Expected [N,H,W,D] grid, got {tuple(grid.shape)}")
     height, width = grid.shape[1:3]
     target_height, target_width = target_grid
-    if height % target_height or width % target_width:
-        raise ValueError(
-            f"DiT view grid {(height, width)} cannot map exactly to {target_grid}"
+    if height % target_height == 0 and width % target_width == 0:
+        scale_height, scale_width = height // target_height, width // target_width
+        grid = grid.reshape(
+            grid.shape[0], target_height, scale_height,
+            target_width, scale_width, grid.shape[3],
         )
-    scale_height, scale_width = height // target_height, width // target_width
-    grid = grid.reshape(
-        grid.shape[0], target_height, scale_height,
-        target_width, scale_width, grid.shape[3],
+        return grid.mean(dim=(2, 4))
+    if target_height % height == 0 and target_width % width == 0:
+        return grid.repeat_interleave(target_height // height, dim=1).repeat_interleave(
+            target_width // width, dim=2,
+        )
+    raise ValueError(
+        f"DiT view grid {(height, width)} cannot map exactly to {target_grid}"
     )
-    return grid.mean(dim=(2, 4))
 
 
 class SpatiallyAlignedAdapter(nn.Module):
@@ -26,7 +30,8 @@ class SpatiallyAlignedAdapter(nn.Module):
 
     Wan stores multiple camera views by stacking their spatial height.  The
     ``num_views`` argument is therefore part of the layout contract: this
-    class refuses ambiguous reshapes and only performs integer area pooling.
+    class refuses ambiguous reshapes and only performs integer area pooling or
+    nearest-cell expansion when the Teacher grid is larger.
     """
 
     def __init__(
@@ -94,7 +99,7 @@ class SpatiallyAlignedAdapter(nn.Module):
             grid.shape[0], grid.shape[1], views, view_height, grid.shape[3], grid.shape[4]
         )
         # Pool each view independently; no token is allowed to cross a view boundary.
-        aligned = _pool_grid(grid.flatten(0, 2), self.target_grid)
+        aligned = _align_grid(grid.flatten(0, 2), self.target_grid)
         return aligned.reshape(
             grid.shape[0], grid.shape[1], views,
             self.target_grid[0], self.target_grid[1], self.vjepa_dim,

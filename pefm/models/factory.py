@@ -24,8 +24,12 @@ def build_evaluator(cfg, pretrained_checkpoint=None):
         encoder.load_state_dict(clean(checkpoint["encoder"]), strict=True)
         del checkpoint
 
+    rgb_grid = tuple(int(value) for value in cfg.get("rgb_grid", [15, 20]))
+    aligned_grid = tuple(int(value) for value in cfg.get("aligned_grid", rgb_grid))
     return VJEPARSSMEvaluator(
         VJEPAObservationAdapter(encoder),
         TokenAggregator(token_dim=1408, embed_dim=256, num_heads=4),
         RSSM(cfg.model.rssm, embed_size=256, act_dim=14),
+        rgb_grid=rgb_grid,
+        aligned_grid=aligned_grid,
     ).to(cfg.device)

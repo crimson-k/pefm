@@ -77,6 +77,17 @@ def test_coordinate_round_trip_and_strict_length():
                              (21, 15, 20), valid_len=6300)
 
 
+def test_adapter_expands_6x8_dit_grid_to_teacher_grid():
+    adapter = SpatiallyAlignedAdapter(
+        4, vjepa_dim=4, target_grid=(12, 16), hidden_dim=4,
+    )
+    hidden = torch.randn(1, 21 * 6 * 8, 4)
+    aligned = adapter(hidden, (21, 6, 8), valid_len=21 * 6 * 8)
+    assert aligned.shape == (1, 21, 1, 12, 16, 4)
+    torch.testing.assert_close(aligned[:, :, :, 0::2, 0::2],
+                               aligned[:, :, :, 1::2, 1::2])
+
+
 def test_phase_b_and_c_gradient_boundaries():
     torch.manual_seed(0)
     teacher = FakeTeacher()

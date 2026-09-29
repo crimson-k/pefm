@@ -8,7 +8,7 @@ from .vjepa_adapter import align_row_major_tokens
 
 class VJEPARSSMEvaluator(nn.Module):
     def __init__(self, vjepa_adapter, token_aggregator, rssm,
-                 rgb_grid=(30, 40), aligned_grid=(15, 20)):
+                 rgb_grid=(15, 20), aligned_grid=(15, 20)):
         super().__init__()
         self.vjepa_adapter = vjepa_adapter
         self.token_aggregator = token_aggregator

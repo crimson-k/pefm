@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+import pyarrow.parquet as pq
 import torch
 from accelerate import Accelerator
 from omegaconf import OmegaConf
@@ -12,14 +13,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pefm.training.config.parser import merge_yaml_and_args
 from pefm.utils.graceful_exit import GracefulExit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
-from dataloader import RawCobotAction, build_RGB_dataloader
+from dataloader import (
+    RawCobotAction, build_RGB_dataloader, relative_eef_actions,
+)
 from pefm.models import build_evaluator
 from pefm.export import (
     check_teacher_contract,
     export_frozen_evaluator,
     teacher_contract,
 )
-from src.bwm.wan_video_action.data.operators import create_video_operator
+from src.bwm.wan_video_action.data.operators import (
+    EEF_NAMES, JOINT_AND_EEF_NAMES, create_video_operator,
+)
 from src.bwm.wan_video_action.data.wan_dataset import RoboTwinUnifiedDataset
 from src.bwm.wan_video_action.utils import load_action_stats, set_global_seed
 
@@ -55,15 +60,79 @@ def mask_teacher_losses(output, losses, reset):
     return losses
 
 
-def make_loader(cfg, metadata_name, first_episode, last_episode, shuffle):
-    metadata_path = Path(cfg.dataset) / metadata_name
-    with metadata_path.open(encoding="utf-8") as file:
+def _metadata_indices(metadata_path, first_episode, last_episode):
+    with Path(metadata_path).open(encoding="utf-8") as file:
         rows = [json.loads(line) for line in file if line.strip()]
-    indices = [
+    return [
         i for i, row in enumerate(rows)
         if first_episode <= int(row.get("source_episode_index", row["episode_index"])) <= last_episode
         and int(row["end_frame"]) - int(row.get("start_frame", 0)) + 1 >= NUM_FRAMES
     ]
+
+
+def compute_action_delta_stats(cfg):
+    """Estimate per-dimension relative-action ranges from the train split."""
+    metadata_path = Path(cfg.dataset) / "metadata_train.jsonl"
+    with metadata_path.open(encoding="utf-8") as file:
+        rows = [json.loads(line) for line in file if line.strip()]
+    rows = [
+        rows[i] for i in _metadata_indices(metadata_path, 0, 39)
+    ]
+    action_indices = [JOINT_AND_EEF_NAMES.index(name) for name in EEF_NAMES]
+    action_cache = {}
+    deltas = []
+    endpoints = torch.cat((
+        torch.zeros(1, dtype=torch.long),
+        torch.arange(TIME_DIVISION_FACTOR, NUM_FRAMES, TIME_DIVISION_FACTOR),
+    ))
+    for row in rows:
+        action = row["action"]
+        if isinstance(action, dict):
+            action_path = action["data"]
+            frame_indices = action.get("frame_indices")
+            start_frame = int(action.get("start_frame", row.get("start_frame", 0)))
+        else:
+            action_path = action
+            frame_indices = None
+            start_frame = int(row.get("start_frame", 0))
+        action_path = Path(action_path)
+        if not action_path.is_absolute():
+            action_path = Path(cfg.dataset) / action_path
+        cache_key = str(action_path)
+        if cache_key not in action_cache:
+            values = pq.read_table(
+                action_path, columns=["observation.state"],
+            ).column("observation.state").to_pylist()
+            eef = torch.as_tensor(values, dtype=torch.float32)
+            if eef.shape[-1] == len(JOINT_AND_EEF_NAMES):
+                eef = eef[:, action_indices]
+            elif eef.shape[-1] != len(EEF_NAMES):
+                raise ValueError(
+                    f"Unexpected EEF width {eef.shape[-1]} in {action_path}"
+                )
+            action_cache[cache_key] = eef
+        eef = action_cache[cache_key]
+        eef = (
+            eef[frame_indices]
+            if frame_indices is not None
+            else eef[start_frame:start_frame + NUM_FRAMES]
+        )
+        deltas.append(relative_eef_actions(eef[endpoints])[1:])
+    values = torch.cat(deltas, dim=0)
+    p01 = torch.quantile(values, 0.01, dim=0)
+    p99 = torch.quantile(values, 0.99, dim=0)
+    return {
+        "version": 1,
+        "method": "relative_eef_p01_p99",
+        "p01": p01.tolist(),
+        "p99": p99.tolist(),
+        "num_samples": int(values.shape[0]),
+    }
+
+
+def make_loader(cfg, metadata_name, first_episode, last_episode, shuffle):
+    metadata_path = Path(cfg.dataset) / metadata_name
+    indices = _metadata_indices(metadata_path, first_episode, last_episode)
     assert indices, f"No episodes {first_episode}-{last_episode} in {metadata_path}"
     dataset = RoboTwinUnifiedDataset(
         base_path=cfg.dataset, metadata_path=str(metadata_path), sample_indices=indices,
@@ -74,6 +143,7 @@ def make_loader(cfg, metadata_name, first_episode, last_episode, shuffle):
     )
     return build_RGB_dataloader(
         dataset, TIME_DIVISION_FACTOR, cfg.batch_size, shuffle=shuffle, num_workers=cfg.workers,
+        action_delta_stats=cfg.action_delta_stats,
     )
 
 def run_epoch(model, loader, cfg, optimizer, epoch, split, accelerator, stop=None):
@@ -148,15 +218,24 @@ def main():
         args = merge_yaml_and_args(args.config, args)
     base, size = OmegaConf.load("src/r2dreamer/configs/model/_base_.yaml"), OmegaConf.load(args.rssm_model_size)
     for unused in ("encoder", "decoder"): del base[unused]
-    cfg = OmegaConf.create({**vars(args), "model": OmegaConf.merge(base, size)})
+    model_overrides = getattr(args, "model", {}) or {}
+    cfg = OmegaConf.create({
+        **vars(args),
+        "model": OmegaConf.merge(base, size, model_overrides),
+    })
     cfg.model.rssm.initial = "zeros"
     resume = torch.load(cfg.resume, map_location="cpu", weights_only=False) if cfg.resume else None
-    assert not (resume and cfg.init_checkpoint), "Use resume or init_checkpoint, not both"
-    if cfg.init_checkpoint:
-        raise ValueError(
-            "The Stage 2 Teacher must train RSSM, TokenAggregator and heads from "
-            "scratch; init_checkpoint is disabled"
-        )
+    saved_action_delta_stats = (
+        resume.get("config", {}).get("action_delta_stats") if resume else None
+    )
+    cfg.action_delta_stats = saved_action_delta_stats or compute_action_delta_stats(cfg)
+    init_checkpoint = (
+        torch.load(cfg.init_checkpoint, map_location="cpu", weights_only=False)
+        if cfg.init_checkpoint else None
+    )
+    assert not (resume and init_checkpoint), "Use resume or init_checkpoint, not both"
+    if init_checkpoint:
+        check_teacher_contract(init_checkpoint, cfg)
     if resume:
         check_teacher_contract(resume, cfg)
     if resume:
@@ -164,6 +243,8 @@ def main():
         saved.device, saved.epochs, saved.resume, saved.seed = cfg.device, cfg.epochs, cfg.resume, resume["seed"]
         saved.init_checkpoint = None
         saved.checkpoint_every = cfg.checkpoint_every
+        saved.model = OmegaConf.merge(saved.model, model_overrides)
+        saved.action_delta_stats = cfg.action_delta_stats
         cfg = saved
     assert cfg.checkpoint_every > 0, "checkpoint_every must be positive"
     cfg.device = str(accelerator.device)
@@ -181,6 +262,9 @@ def main():
     # frozen; the RSSM checkpoint produced here is the teacher state space
     # that a later latent/Main branch must reuse.
     model.vjepa_adapter.encoder.requires_grad_(False)
+    if init_checkpoint:
+        model.load_state_dict(init_checkpoint["model"], strict=True)
+        del init_checkpoint
     for name in cfg.get("freeze", []):
         model.get_submodule(name).requires_grad_(False)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]

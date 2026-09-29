@@ -7,6 +7,7 @@ Each file contains ``hidden``, ``dit_grid``, ``valid_len`` and either a nested
 
 import argparse
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -141,6 +142,19 @@ def _teacher_contract(bundle_path):
     return contract
 
 
+def _write_selection(path, *, best_path, last_path, best_epoch, last_epoch, best_score):
+    selection = {
+        "best_path": Path(best_path).name,
+        "last_path": Path(last_path).name,
+        "best_epoch": int(best_epoch),
+        "last_epoch": int(last_epoch),
+        "best_score": float(best_score),
+    }
+    temporary = str(path) + ".tmp"
+    Path(temporary).write_text(json.dumps(selection, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def train_adapter(
     teacher_bundle,
     train_loader,
@@ -155,7 +169,7 @@ def train_adapter(
     weight_decay=0.01,
     valid_loader=None,
     noise_sampling=None,
-    target_grid=(15, 20),
+    target_grid=(12, 16),
     num_views=1,
     hidden_dim=None,
     token_scale=0.0,
@@ -165,9 +179,13 @@ def train_adapter(
     accelerator=None,
 ):
     """Train and export the best Adapter using a caller-provided DataLoader."""
-    if tuple(target_grid) != (15, 20) or int(num_views) != 1:
-        raise ValueError("Phase B currently supports only target_grid=(15,20), num_views=1")
     teacher_contract = _teacher_contract(teacher_bundle)
+    expected_grid = tuple(teacher_contract.get("aligned_grid", target_grid))
+    if tuple(target_grid) != expected_grid or int(num_views) != 1:
+        raise ValueError(
+            "Phase B requires one view and target_grid matching the Teacher grid "
+            f"{expected_grid}"
+        )
     teacher = load_frozen_evaluator(teacher_bundle, device=device, dtype=dtype)
     adapter = SpatiallyAlignedAdapter(
         dit_dim=dit_dim,
@@ -195,7 +213,9 @@ def train_adapter(
     if accelerator is not None:
         accelerator.wait_for_everyone()
     best_score = None
-    best_path = output / "best_adapter.pt"
+    best_epoch = None
+    best_path = None
+    last_path = output / f"adapter_epoch_{int(epochs):04d}.pt"
     for epoch in range(1, int(epochs) + 1):
         train_metrics = run_adapter_epoch(
             distiller, train_loader, device, optimizer,
@@ -223,27 +243,20 @@ def train_adapter(
             print(message, flush=True)
         else:
             accelerator.print(message)
-        path = output / f"adapter_epoch_{epoch:04d}.pt"
         exported_adapter = (
             accelerator.unwrap_model(distiller).adapter
             if accelerator is not None else adapter
         )
         is_main_process = accelerator is None or accelerator.is_main_process
-        if is_main_process:
-            export_stage2_adapter(
-                path,
-                exported_adapter,
-                selected_block=selected_block,
-                teacher_contract=teacher_contract,
-                noise_sampling=noise_sampling,
-                epoch=epoch,
-                metrics={"train": train_metrics, "valid": valid_metrics},
-            )
         if best_score is None or score > best_score:
+            new_best_path = output / f"adapter_epoch_{epoch:04d}.pt"
             best_score = score
+            best_epoch = epoch
             if is_main_process:
+                if best_path is not None and best_path != new_best_path and best_path.exists():
+                    best_path.unlink()
                 export_stage2_adapter(
-                    best_path,
+                    new_best_path,
                     exported_adapter,
                     selected_block=selected_block,
                     teacher_contract=teacher_contract,
@@ -251,8 +264,30 @@ def train_adapter(
                     epoch=epoch,
                     metrics={"train": train_metrics, "valid": valid_metrics},
                 )
+            best_path = new_best_path
         if accelerator is not None:
             accelerator.wait_for_everyone()
+    if is_main_process and last_path != best_path:
+        export_stage2_adapter(
+            last_path,
+            exported_adapter,
+            selected_block=selected_block,
+            teacher_contract=teacher_contract,
+            noise_sampling=noise_sampling,
+            epoch=int(epochs),
+            metrics={"train": train_metrics, "valid": valid_metrics},
+        )
+    if is_main_process:
+        _write_selection(
+            output / "adapter_selection.json",
+            best_path=best_path,
+            last_path=last_path,
+            best_epoch=best_epoch,
+            last_epoch=int(epochs),
+            best_score=best_score,
+        )
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
     return best_path
 
 
@@ -289,7 +324,7 @@ def main():
                    if key != "config" and value is not None})
     defaults = {
         "device": "cuda", "dtype": "bfloat16", "epochs": 1,
-        "lr": 1e-4, "weight_decay": 0.01, "target_grid": [15, 20],
+        "lr": 1e-4, "weight_decay": 0.01, "target_grid": [12, 16],
         "num_views": 1, "hidden_dim": None, "noise_sampling": None,
         "token_scale": 0.0, "embedding_scale": 1.0, "posterior_scale": 1.0,
         "prior_metric_scale": 1.0,

@@ -59,12 +59,30 @@ def relative_eef_actions(eef):
     return torch.cat((torch.zeros_like(eef[..., :1, :]), delta), dim=-2)
 
 
+def normalize_action_delta(action_delta, stats):
+    """Map each relative-action dimension to the train-set p01--p99 range."""
+    if stats is None:
+        return action_delta
+    p01 = torch.as_tensor(
+        stats["p01"], device=action_delta.device, dtype=action_delta.dtype,
+    )
+    p99 = torch.as_tensor(
+        stats["p99"], device=action_delta.device, dtype=action_delta.dtype,
+    )
+    span = p99 - p01
+    normalized = 2.0 * (action_delta - p01) / span.clamp_min(1e-6) - 1.0
+    normalized = normalized.clamp(-1.0, 1.0)
+    return torch.where(span > 1e-6, normalized, action_delta.clamp(-1.0, 1.0))
+
+
 class EvaluatorDataset(Dataset):
     """Convert one BWM sample into aligned RGB and grouped EEF tensors."""
 
-    def __init__(self, bwm_dataset: Dataset, time_division_factor: int = 4):
+    def __init__(self, bwm_dataset: Dataset, time_division_factor: int = 4,
+                 action_delta_stats=None):
         self.bwm_dataset = bwm_dataset
         self.time_division_factor = time_division_factor
+        self.action_delta_stats = action_delta_stats
 
     def __len__(self):
         return len(self.bwm_dataset)
@@ -84,6 +102,9 @@ class EvaluatorDataset(Dataset):
                                torch.arange(self.time_division_factor, rgb.shape[2], self.time_division_factor)))
         grouped_eef = eef[endpoints]
         frame_indices = sample.get("frame_indices", range(rgb.shape[2]))
+        action_delta = normalize_action_delta(
+            relative_eef_actions(grouped_eef), self.action_delta_stats,
+        )
         return {
             "sample_id": sample.get("sample_id", index),
             "task": sample.get("task", ""),
@@ -91,16 +112,17 @@ class EvaluatorDataset(Dataset):
             "split": sample.get("split", ""),
             "rgb": rgb,
             "eef": grouped_eef,
-            "action_delta": relative_eef_actions(grouped_eef),
+            "action_delta": action_delta,
             "frame_indices": torch.as_tensor(frame_indices, dtype=torch.long),
             "group_ids": group_ids,
             "reset": torch.arange(int(group_ids[-1]) + 1) == 0,
         }
 
 
-def build_RGB_dataloader(bwm_dataset, time_division_factor, batch_size=4, shuffle=True, num_workers=4):
+def build_RGB_dataloader(bwm_dataset, time_division_factor, batch_size=4, shuffle=True,
+                         num_workers=4, action_delta_stats=None):
     return DataLoader(
-        EvaluatorDataset(bwm_dataset, time_division_factor),
+        EvaluatorDataset(bwm_dataset, time_division_factor, action_delta_stats),
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
@@ -108,7 +130,7 @@ def build_RGB_dataloader(bwm_dataset, time_division_factor, batch_size=4, shuffl
     )
 
 
-def stage2_teacher_batch(rgb, eef, time_division_factor=4):
+def stage2_teacher_batch(rgb, eef, time_division_factor=4, action_delta_stats=None):
     """Build the 21-step frozen-Teacher input from one BWM training sample."""
     if rgb.ndim == 5:
         rgb = rgb.unsqueeze(0)
@@ -134,6 +156,8 @@ def stage2_teacher_batch(rgb, eef, time_division_factor=4):
     return {
         "rgb": rgb,
         "group_ids": group_ids.expand(rgb.shape[0], -1),
-        "action_delta": relative_eef_actions(grouped_eef),
+        "action_delta": normalize_action_delta(
+            relative_eef_actions(grouped_eef), action_delta_stats,
+        ),
         "reset": (torch.arange(groups, device=rgb.device) == 0).expand(rgb.shape[0], -1),
     }

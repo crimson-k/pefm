@@ -1,4 +1,4 @@
-dataset: "/data1/fangxuebin/boundless-world-model/converted_dataset_bwm_6tasks"
+dataset: "/data1/fangxuebin/boundless-world-model/converted_dataset_bwm_6tasks_320x240"
 vjepa_checkpoint: "/data1/fangxuebin/models/vjepa2/vjepa2-ac-vitg.pt"
 output: "outputs/evaluator/soft_6tasks_epoch_100"
 resume: null

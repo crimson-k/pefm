@@ -17,6 +17,12 @@ HISTORY_GROUPS = 3
 TARGET_GRID = (15, 20)
 
 
+def _teacher_target_grid(teacher_contract, fallback=TARGET_GRID):
+    if isinstance(teacher_contract, Mapping):
+        return tuple(teacher_contract.get("aligned_grid", fallback))
+    return tuple(fallback)
+
+
 def _plain(value):
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -59,8 +65,11 @@ def _check_adapter_contract(bundle, *, dit_dim=None, selected_block=None,
         raise ValueError("Adapter bundle must use time_groups=21")
     if int(bundle.get("history_groups", -1)) != HISTORY_GROUPS:
         raise ValueError("Adapter bundle must use history_groups=3")
-    if tuple(bundle.get("target_grid", ())) != TARGET_GRID:
-        raise ValueError("Adapter bundle must target the V-JEPA 15x20 grid")
+    expected_grid = _teacher_target_grid(teacher_contract)
+    if tuple(bundle.get("target_grid", ())) != expected_grid:
+        raise ValueError(
+            f"Adapter bundle target grid must match the Teacher grid {expected_grid}"
+        )
     if int(bundle.get("num_views", -1)) != 1:
         raise ValueError("PEFM Stage 2 currently supports num_views=1 only")
     for key in ("dit_dim", "vjepa_dim", "selected_block", "teacher_contract", "noise_sampling"):
@@ -95,10 +104,14 @@ def export_stage2_adapter(
     metrics=None,
 ):
     """Save only Adapter weights plus the contracts needed by Phase C."""
-    if int(adapter.num_views) != 1 or tuple(adapter.target_grid) != TARGET_GRID:
-        raise ValueError("Stage 2 Adapter export requires one view and a 15x20 target grid")
     if not isinstance(teacher_contract, Mapping):
         raise ValueError("teacher_contract must be a mapping")
+    target_grid = _teacher_target_grid(teacher_contract)
+    if int(adapter.num_views) != 1 or tuple(adapter.target_grid) != target_grid:
+        raise ValueError(
+            "Stage 2 Adapter export requires one view and a target grid matching "
+            f"the Teacher grid {target_grid}"
+        )
     state = {
         key: value.detach().cpu().clone()
         for key, value in adapter.state_dict().items()
@@ -109,7 +122,7 @@ def export_stage2_adapter(
         "dit_dim": int(adapter.dit_dim),
         "vjepa_dim": int(adapter.vjepa_dim),
         "hidden_dim": int(adapter.hidden_dim),
-        "target_grid": list(TARGET_GRID),
+        "target_grid": list(target_grid),
         "num_views": 1,
         "time_groups": TIME_GROUPS,
         "history_groups": HISTORY_GROUPS,
