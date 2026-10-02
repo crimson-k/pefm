@@ -1,269 +1,137 @@
-"""Small CPU checks for the PEFM-side Stage 2 contracts."""
+"""CPU 验证：动作时序、冻结梯度、统计量与 checkpoint 一致性。"""
 
-import copy
-import math
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
+import unittest
 
 import torch
-import pytest
-from omegaconf import OmegaConf
 from torch import nn
 
-from pefm.export import (
-    check_teacher_contract,
-    export_stage2_adapter,
-    load_stage2_adapter,
-    teacher_contract,
-)
-from pefm.models import (
-    SpatiallyAlignedAdapter,
-    TemporalSemanticDistillation,
-    TokenAggregator,
-    categorical_kl,
-    token_alignment_metrics,
-)
+from pefm.data import stage2_teacher_batch
+from pefm.export.stage2 import export_predictor, export_stage2_adapter, load_predictor, load_stage2_adapter
+from pefm.models import ActionPredictor, SpatiallyAlignedAdapter, TemporalSemanticDistillation, TokenAggregator
+from pefm.training.train_predictor import fit_statistics, targets_at_horizon
+from pefm.training.train_adapter import run_adapter_epoch
 
 
-class FakeTeacher(nn.Module):
-    """Tiny frozen Teacher with the same spatial/pooled/logit interfaces."""
-
-    def __init__(self):
-        super().__init__()
-        self.token_aggregator = TokenAggregator(token_dim=4, embed_dim=3, num_heads=1)
-        self.state_head = nn.Linear(3, 6)
-        self.action_head = nn.Linear(14, 6)
-
-    def _posterior(self, embed):
-        return self.state_head(embed).reshape(embed.shape[0], embed.shape[1], 2, 3)
-
-    def forward(self, batch):
-        visual_grid = batch["visual_grid"]
-        embed = self.token_aggregator(visual_grid.flatten(2, 4))
-        return {
-            "visual_grid": visual_grid,
-            "embed": embed,
-            "posterior_logits": self._posterior(embed),
-        }
-
-    def forward_embeddings(self, embed, actions, reset):
-        posterior = self._posterior(embed)
-        # p_t depends on e_{t-1} and the preceding action, mirroring the
-        # one-step RSSM offset and making action-shuffle checks meaningful.
-        action_logits = self.action_head(actions).reshape(actions.shape[0], actions.shape[1], 2, 3)
-        prior = torch.cat((posterior[:, :1], posterior[:, :-1] + action_logits[:, :-1]), dim=1)
-        return {"embed": embed, "posterior_logits": posterior, "prior_logits": prior}
+class TinyVisual(nn.Module):
+    def forward(self, rgb, group_ids):
+        return rgb
 
 
-def teacher_batch():
-    return {
-        "rgb": torch.zeros(1, 1, 3, 81, 2, 2),
-        "group_ids": torch.cat((torch.zeros(1, dtype=torch.long),
-                                 torch.arange(1, 21).repeat_interleave(4))).view(1, -1),
-        "action_delta": torch.randn(1, 21, 14),
-        "reset": torch.tensor([[True] + [False] * 20]),
-        "visual_grid": torch.randn(1, 21, 1, 15, 20, 4),
-    }
+def make_model():
+    teacher = SimpleNamespace(vjepa_adapter=TinyVisual(),
+                              token_aggregator=TokenAggregator(4, 6, num_heads=2),
+                              rgb_grid=(2, 2), aligned_grid=(2, 2))
+    return TemporalSemanticDistillation(teacher, SpatiallyAlignedAdapter(5, 4, (2, 2)),
+                                        ActionPredictor(6, 8))
 
 
-def test_coordinate_round_trip_and_strict_length():
-    adapter = SpatiallyAlignedAdapter(4, vjepa_dim=4, hidden_dim=4)
-    coordinates = torch.arange(21 * 15 * 20 * 4, dtype=torch.float32).reshape(1, -1, 4)
-    restored = adapter.restore_grid(coordinates, (21, 15, 20), valid_len=6300)
-    torch.testing.assert_close(
-        restored.reshape_as(coordinates), coordinates,
-    )
-    assert restored[0, 3, 7, 11, 2] == coordinates[0, (3 * 15 + 7) * 20 + 11, 2]
-    with pytest.raises(ValueError, match="strict grid"):
-        adapter.restore_grid(torch.cat((coordinates, coordinates[:, :1]), dim=1),
-                             (21, 15, 20), valid_len=6300)
+class SemanticTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(7)
+        torch.set_num_threads(1)
+
+    def batch(self):
+        return {"rgb": torch.randn(2, 21, 4, 4), "group_ids": None,
+                "action_segments": torch.randn(2, 21, 4, 14)}
+
+    def test_frame_actions_preserve_four_frame_order(self):
+        eef = torch.zeros(1, 81, 14)
+        eef[0, :, 0] = torch.arange(81).square()
+        result = stage2_teacher_batch(torch.zeros(1, 1, 3, 81, 2, 2), eef)
+        torch.testing.assert_close(result["action_segments"][0, 4, :, 0], torch.tensor([25., 27., 29., 31.]))
+        self.assertEqual(tuple(result["action_segments"].shape), (1, 21, 4, 14))
+        with self.assertRaises(ValueError):
+            stage2_teacher_batch(torch.zeros(1, 1, 3, 81, 2, 2), eef[:, ::4])
+
+    def test_pairs_and_open_loop(self):
+        model = ActionPredictor(6, 8)
+        embed, actions = torch.randn(2, 21, 6), torch.randn(2, 21, 4, 14)
+        first = model.pairs(embed, actions)
+        self.assertEqual(tuple(first.shape), (2, 17, 1, 6))
+        torch.testing.assert_close(first[:, 0], model(embed[:, 3], actions[:, 4:5]))
+        rollout = model.pairs(embed, actions, 4)[:, 0]
+        changed = embed.clone()
+        changed[:, 4:] += 100
+        torch.testing.assert_close(rollout, model.pairs(changed, actions, 4)[:, 0])
+        self.assertFalse(torch.allclose(rollout, model.pairs(embed, actions.flip(2), 4)[:, 0]))
+        no_action = ActionPredictor(6, 8, use_actions=False)
+        torch.testing.assert_close(no_action.pairs(embed, actions), no_action.pairs(embed, actions * 20))
+
+    def test_each_loss_reaches_only_current_groups(self):
+        for term in ("align", "pred"):
+            model = make_model().freeze_adapter()
+            hidden = torch.randn(2, 84, 5, requires_grad=True)
+            output = model(hidden, (21, 2, 2), self.batch(), torch.tensor([.2]), 84)
+            self.assertEqual(tuple(output[term + "_per_step"].shape), (2, 17))
+            output[term].backward()
+            grad = hidden.grad.reshape(2, 21, -1).norm(dim=-1)
+            self.assertTrue(torch.isfinite(grad).all())
+            self.assertTrue((grad[:, 3:20] > 0).all())
+            self.assertEqual(float(grad[:, :3].sum() + grad[:, 20:].sum()), 0.)
+            self.assertTrue(all(p.grad is None for p in model.parameters()))
+            self.assertFalse(output["target"].requires_grad)
+
+    def test_adapter_is_group_local_and_sigma_conditioned(self):
+        model = make_model()
+        hidden = torch.randn(1, 84, 5)
+        first = model.adapter(hidden, (21, 2, 2), torch.tensor([.1]), 84)
+        changed = hidden.clone().reshape(1, 21, 4, 5)
+        changed[:, 10] += torch.randn(4, 5)
+        second = model.adapter(changed.flatten(1, 2), (21, 2, 2), torch.tensor([.1]), 84)
+        torch.testing.assert_close(first[:, :10], second[:, :10])
+        torch.testing.assert_close(first[:, 11:], second[:, 11:])
+        noisy = model.adapter(hidden, (21, 2, 2), torch.tensor([.8]), 84)
+        self.assertFalse(torch.allclose(first, noisy))
+
+    def test_phase_b_only_updates_adapter_and_masks_noise(self):
+        model = make_model()
+        batch = {"hidden": torch.randn(2, 84, 5), "dit_grid": (21, 2, 2), "valid_len": 84,
+                 "teacher_batch": self.batch(), "noise_sigma": torch.tensor([.2])}
+        frozen = {name: p.clone() for name, p in model.named_parameters() if not p.requires_grad}
+        before = [p.clone() for p in model.adapter.parameters()]
+        optimizer = torch.optim.AdamW(model.adapter.parameters(), lr=.01)
+        metrics = run_adapter_epoch(model, [batch], "cpu", 1., optimizer)
+        self.assertTrue(any(not torch.equal(a, b) for a, b in zip(before, model.adapter.parameters())))
+        self.assertTrue(all(torch.equal(frozen[n], p) for n, p in model.named_parameters() if n in frozen))
+        self.assertIn("gt_start_pred_mse", metrics)
+        model.sigma_max = .1
+        with self.assertRaisesRegex(ValueError, "No captures"):
+            run_adapter_epoch(model, [batch], "cpu", 1.)
+
+    def test_predictor_training_and_checkpoint_roundtrip(self):
+        model = ActionPredictor(6, 8)
+        embed = torch.randn(4, 21, 6)
+        stats = fit_statistics(model, [{"embed": embed}])
+        self.assertGreater(stats["variance_mean"], 0)
+        actions = torch.randn(4, 21, 4, 14)
+        optimizer = torch.optim.Adam(model.parameters(), lr=.02)
+        target = targets_at_horizon(embed, 1)
+        initial = float(model.distance(model.pairs(embed, actions), target).mean().detach())
+        for _ in range(25):
+            loss = model.distance(model.pairs(embed, actions), target).mean()
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        self.assertLess(float(loss.detach()), initial * .8)
+        adapter = SpatiallyAlignedAdapter(5, 4, (2, 2))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            export_predictor(path / "p.pt", model, "teacher")
+            bundle = torch.load(path / "p.pt", weights_only=False)
+            loaded = load_predictor(bundle)
+            torch.testing.assert_close(model.pairs(embed, actions), loaded.pairs(embed, actions))
+            export_stage2_adapter(path / "a.pt", adapter, predictor_bundle=bundle,
+                                  selected_block=15, teacher_sha256="teacher", sigma_max=.4)
+            restored = load_stage2_adapter(path / "a.pt", device="cpu", selected_block=15)
+            for a, b in zip(adapter.parameters(), restored.parameters()):
+                torch.testing.assert_close(a, b)
+            with self.assertRaises(ValueError):
+                load_stage2_adapter(path / "a.pt", device="cpu", selected_block=14)
+            with self.assertRaises(ValueError):
+                export_stage2_adapter(path / "bad.pt", adapter, predictor_bundle=bundle,
+                                      selected_block=15, teacher_sha256="wrong")
 
 
-def test_adapter_expands_6x8_dit_grid_to_teacher_grid():
-    adapter = SpatiallyAlignedAdapter(
-        4, vjepa_dim=4, target_grid=(12, 16), hidden_dim=4,
-    )
-    hidden = torch.randn(1, 21 * 6 * 8, 4)
-    aligned = adapter(hidden, (21, 6, 8), valid_len=21 * 6 * 8)
-    assert aligned.shape == (1, 21, 1, 12, 16, 4)
-    torch.testing.assert_close(aligned[:, :, :, 0::2, 0::2],
-                               aligned[:, :, :, 1::2, 1::2])
-
-
-def test_phase_b_and_c_gradient_boundaries():
-    torch.manual_seed(0)
-    teacher = FakeTeacher()
-    adapter = SpatiallyAlignedAdapter(4, vjepa_dim=4, hidden_dim=4)
-    distiller = TemporalSemanticDistillation(teacher, adapter)
-    batch = teacher_batch()
-    hidden = torch.randn(1, 6300, 4, requires_grad=True)
-
-    adapter_result = distiller(
-        hidden.detach(), (21, 15, 20), valid_len=6300,
-        teacher_batch=batch, phase="adapter",
-    )
-    adapter_result["adapter"]["total"].backward()
-    assert any(parameter.grad is not None for parameter in adapter.parameters())
-    assert all(parameter.grad is None for parameter in teacher.parameters())
-    assert torch.isfinite(adapter_result["adapter"]["total"])
-    teacher_state = {
-        name: value.detach().clone() for name, value in teacher.state_dict().items()
-    }
-    adapter_state = {
-        name: value.detach().clone() for name, value in adapter.state_dict().items()
-    }
-
-    for parameter in adapter.parameters():
-        parameter.grad = None
-    hidden = hidden.detach().requires_grad_(True)
-    distiller.freeze_adapter()
-    prior_result = distiller(
-        hidden, (21, 15, 20), valid_len=6300,
-        teacher_batch=batch, phase="bwm",
-    )
-    prior_outputs = prior_result["prior"]
-    assert prior_outputs["gt_posterior"].shape == (1, 17, 2, 3)
-    assert prior_outputs["generated_prior"].shape == (1, 17, 2, 3)
-    assert not prior_outputs["gt_posterior"].requires_grad
-    assert prior_outputs["generated_prior"].requires_grad
-    assert "prior_kl" not in prior_outputs
-    # BWM owns this KL reduction; the test only simulates its consumer.
-    categorical_kl(
-        prior_outputs["gt_posterior"], prior_outputs["generated_prior"],
-    ).mean().backward()
-    assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
-    step_grad = hidden.grad.reshape(1, 21, -1, 4).norm(dim=(-1, -2))[0]
-    assert step_grad[19] > 0
-    torch.testing.assert_close(step_grad[20], torch.zeros_like(step_grad[20]))
-    assert all(parameter.grad is None for parameter in adapter.parameters())
-    assert all(parameter.grad is None for parameter in teacher.parameters())
-    for name, value in teacher.state_dict().items():
-        torch.testing.assert_close(value, teacher_state[name])
-    for name, value in adapter.state_dict().items():
-        torch.testing.assert_close(value, adapter_state[name])
-
-
-def test_token_diagnostics_and_adapter_bundle(tmp_path):
-    target = torch.randn(1, 4, 1, 2, 2, 3)
-    metrics = token_alignment_metrics(target, target)
-    assert metrics["correct_cosine"] > metrics["shuffled_spatial_cosine"]
-    assert metrics["correct_cosine"] > metrics["shuffled_time_view_cosine"]
-    paired = torch.cat((target, target + 0.1), dim=0)
-    mismatched = paired.flip(0)
-    assert token_alignment_metrics(paired, paired)["correct_cosine"] > (
-        token_alignment_metrics(paired, mismatched)["correct_cosine"]
-    )
-
-    adapter = SpatiallyAlignedAdapter(4, vjepa_dim=4, hidden_dim=4)
-    path = export_stage2_adapter(
-        tmp_path / "adapter.pt", adapter, selected_block=20,
-        teacher_contract={"state_space": "shared_rssm_v1", "time_groups": 21},
-    )
-    loaded = load_stage2_adapter(
-        path, device="cpu", dit_dim=4, selected_block=20,
-        teacher_contract={"state_space": "shared_rssm_v1", "time_groups": 21},
-    )
-    assert loaded.training
-    hidden = torch.randn(1, 6300, 4)
-    torch.testing.assert_close(
-        adapter(hidden, (21, 15, 20), valid_len=6300),
-        loaded(hidden, (21, 15, 20), valid_len=6300),
-    )
-    loaded = load_stage2_adapter(
-        path, device="cpu", dit_dim=4, selected_block=20,
-        teacher_contract={"state_space": "shared_rssm_v1", "time_groups": 21},
-        freeze=True,
-    )
-    assert not loaded.training
-    assert all(not parameter.requires_grad for parameter in loaded.parameters())
-    for name, value in adapter.state_dict().items():
-        torch.testing.assert_close(value, loaded.state_dict()[name])
-    with pytest.raises(ValueError, match="DiT hidden dim mismatch"):
-        load_stage2_adapter(
-            path, device="cpu", dit_dim=8, selected_block=20,
-            teacher_contract={"state_space": "shared_rssm_v1", "time_groups": 21},
-        )
-
-
-def test_adapter_pairing_acceptance():
-    """A content-matched hidden/GT pair must beat a cross-sample pairing."""
-    class IdentityAdapter(nn.Module):
-        dit_dim = 4
-        vjepa_dim = 4
-        target_grid = (15, 20)
-        num_views = 1
-
-        def forward(self, hidden, dit_grid, valid_len=None, num_views=None):
-            del valid_len, num_views
-            time, height, width = (int(value) for value in dit_grid)
-            return hidden.reshape(hidden.shape[0], time, 1, height, width, -1)
-
-    torch.manual_seed(7)
-    teacher = FakeTeacher().eval()
-    distiller = TemporalSemanticDistillation(teacher, IdentityAdapter())
-    batch = teacher_batch()
-    other = teacher_batch()
-    paired_batch = {
-        key: torch.cat((batch[key], other[key]), dim=0)
-        for key in ("rgb", "group_ids", "action_delta", "reset", "visual_grid")
-    }
-    hidden = paired_batch["visual_grid"].flatten(1, 4)
-    paired = distiller(
-        hidden, (21, 15, 20), valid_len=6300,
-        teacher_batch=paired_batch, phase="adapter",
-    )["adapter"]
-    mismatched_batch = {
-        key: value.flip(0) for key, value in paired_batch.items()
-    }
-    mismatched = distiller(
-        hidden, (21, 15, 20), valid_len=6300,
-        teacher_batch=mismatched_batch, phase="adapter",
-    )["adapter"]
-    assert paired["embedding_mse"] < mismatched["embedding_mse"]
-    assert paired["posterior_kl"] < mismatched["posterior_kl"]
-
-
-def test_teacher_state_and_action_acceptance():
-    torch.manual_seed(1)
-    teacher = FakeTeacher().eval()
-    batch = teacher_batch()
-    output = teacher(batch)
-    probabilities = output["posterior_logits"].softmax(-1)
-    entropy = -(probabilities * probabilities.clamp_min(1e-8).log()).sum(-1).mean()
-    temporal_variance = probabilities.var(dim=1).mean()
-    assert temporal_variance > 1e-8
-    assert entropy < math.log(3.0)
-
-    normal = teacher.forward_embeddings(
-        output["embed"], batch["action_delta"], batch["reset"],
-    )
-    shuffled_actions = batch["action_delta"][:, torch.arange(20, -1, -1)]
-    shuffled = teacher.forward_embeddings(
-        output["embed"], shuffled_actions, batch["reset"],
-    )
-    assert (
-        normal["prior_logits"][:, 4:] - shuffled["prior_logits"][:, 4:]
-    ).abs().mean() > 1e-6
-
-
-def teacher_config():
-    return OmegaConf.create({
-        "model": {
-            "rssm": {
-                "stoch": 32, "deter": 2048, "hidden": 256, "discrete": 16,
-                "img_layers": 2, "obs_layers": 1, "dyn_layers": 1,
-                "blocks": 8, "act": "SiLU", "unimix_ratio": 0.01,
-                "initial": "zeros",
-            },
-        },
-    })
-
-
-def test_teacher_contract_rejects_old_or_incompatible_checkpoint():
-    cfg = teacher_config()
-    contract = teacher_contract(cfg)
-    check_teacher_contract({"semantic_teacher": contract}, cfg)
-    with pytest.raises(ValueError, match="missing the semantic_teacher"):
-        check_teacher_contract({}, cfg)
-    incompatible = copy.deepcopy(contract)
-    incompatible["rssm"]["deter"] += 1
-    with pytest.raises(ValueError, match="Teacher contract mismatch"):
-        check_teacher_contract({"semantic_teacher": incompatible}, cfg)
+if __name__ == "__main__":
+    unittest.main()

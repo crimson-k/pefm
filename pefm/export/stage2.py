@@ -1,213 +1,96 @@
-"""Checkpoint contracts for the PEFM-side Stage 2 Adapter."""
+"""GRU predictor 与带噪声条件的 Adapter checkpoint。"""
 
-import os
-from collections.abc import Mapping
+import hashlib
 from pathlib import Path
 
 import torch
 
-from pefm.models import SpatiallyAlignedAdapter, TemporalSemanticDistillation
-
+from pefm.models import ActionPredictor, SpatiallyAlignedAdapter, TemporalSemanticDistillation
 from .frozen import load_frozen_evaluator
 
-
-FORMAT = "pefm-spatial-adapter-v1"
-TIME_GROUPS = 21
-HISTORY_GROUPS = 3
-TARGET_GRID = (15, 20)
+FORMAT = "pefm-embedding-adapter-v1"
+PREDICTOR_FORMAT = "pefm-embedding-predictor-v1"
 
 
-def _teacher_target_grid(teacher_contract, fallback=TARGET_GRID):
-    if isinstance(teacher_contract, Mapping):
-        return tuple(teacher_contract.get("aligned_grid", fallback))
-    return tuple(fallback)
-
-
-def _plain(value):
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, Mapping):
-        return {key: _plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_plain(item) for item in value]
-    return value
+def teacher_identity(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _write_bundle(path, bundle):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = str(path) + ".tmp"
+    temporary = path.with_suffix(".tmp")
     torch.save(bundle, temporary)
-    os.replace(temporary, path)
+    temporary.replace(path)
     return path
 
 
-def _check_teacher_contract(actual, expected):
-    if expected is None:
-        return
-    if not isinstance(actual, Mapping):
-        raise ValueError("Adapter bundle has no teacher_contract")
-    for key, value in expected.items():
-        if actual.get(key) != value:
-            raise ValueError(
-                f"Teacher contract mismatch for {key}: "
-                f"bundle={actual.get(key)!r}, expected={value!r}"
-            )
+def _state(model):
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
 
-def _check_adapter_contract(bundle, *, dit_dim=None, selected_block=None,
-                            teacher_contract=None, noise_sampling=None):
-    if not isinstance(bundle, Mapping):
-        raise ValueError("Adapter bundle must be a mapping")
-    if bundle.get("format") != FORMAT:
-        raise ValueError(f"Unsupported Stage 2 Adapter format: {bundle.get('format')!r}")
-    if int(bundle.get("time_groups", -1)) != TIME_GROUPS:
-        raise ValueError("Adapter bundle must use time_groups=21")
-    if int(bundle.get("history_groups", -1)) != HISTORY_GROUPS:
-        raise ValueError("Adapter bundle must use history_groups=3")
-    expected_grid = _teacher_target_grid(teacher_contract)
-    if tuple(bundle.get("target_grid", ())) != expected_grid:
-        raise ValueError(
-            f"Adapter bundle target grid must match the Teacher grid {expected_grid}"
-        )
-    if int(bundle.get("num_views", -1)) != 1:
-        raise ValueError("PEFM Stage 2 currently supports num_views=1 only")
-    for key in ("dit_dim", "vjepa_dim", "selected_block", "teacher_contract", "noise_sampling"):
-        if key not in bundle:
-            raise ValueError(f"Adapter bundle is missing contract field: {key}")
-    if not isinstance(bundle["teacher_contract"], Mapping):
-        raise ValueError("Adapter bundle teacher_contract must be a mapping")
-    if not isinstance(bundle.get("model"), Mapping):
-        raise ValueError("Adapter bundle is missing model weights")
-    if dit_dim is not None and int(bundle.get("dit_dim", -1)) != int(dit_dim):
-        raise ValueError(
-            f"DiT hidden dim mismatch: bundle={bundle.get('dit_dim')}, expected={dit_dim}"
-        )
-    if selected_block is not None and int(bundle.get("selected_block", -1)) != int(selected_block):
-        raise ValueError(
-            f"Selected DiT block mismatch: bundle={bundle.get('selected_block')}, "
-            f"expected={selected_block}"
-        )
-    _check_teacher_contract(bundle.get("teacher_contract"), teacher_contract)
-    if noise_sampling is not None and bundle.get("noise_sampling") != _plain(noise_sampling):
-        raise ValueError("Adapter noise_sampling contract does not match")
+def export_predictor(path, predictor, teacher_sha256, **metadata):
+    return _write_bundle(path, dict(
+        format=PREDICTOR_FORMAT, model=_state(predictor),
+        embed_dim=predictor.embed_dim, hidden_dim=predictor.hidden_dim,
+        use_actions=predictor.use_actions, teacher_sha256=teacher_sha256,
+        **metadata,
+    ))
 
 
-def export_stage2_adapter(
-    path,
-    adapter,
-    *,
-    selected_block,
-    teacher_contract,
-    noise_sampling=None,
-    epoch=None,
-    metrics=None,
-):
-    """Save only Adapter weights plus the contracts needed by Phase C."""
-    if not isinstance(teacher_contract, Mapping):
-        raise ValueError("teacher_contract must be a mapping")
-    target_grid = _teacher_target_grid(teacher_contract)
-    if int(adapter.num_views) != 1 or tuple(adapter.target_grid) != target_grid:
-        raise ValueError(
-            "Stage 2 Adapter export requires one view and a target grid matching "
-            f"the Teacher grid {target_grid}"
-        )
-    state = {
-        key: value.detach().cpu().clone()
-        for key, value in adapter.state_dict().items()
-    }
-    bundle = {
-        "format": FORMAT,
-        "model": state,
-        "dit_dim": int(adapter.dit_dim),
-        "vjepa_dim": int(adapter.vjepa_dim),
-        "hidden_dim": int(adapter.hidden_dim),
-        "target_grid": list(target_grid),
-        "num_views": 1,
-        "time_groups": TIME_GROUPS,
-        "history_groups": HISTORY_GROUPS,
-        "selected_block": int(selected_block),
-        "teacher_contract": _plain(teacher_contract),
-        "noise_sampling": _plain(noise_sampling),
-    }
-    if epoch is not None:
-        bundle["epoch"] = int(epoch)
-    if metrics is not None:
-        bundle["metrics"] = _plain(metrics)
-    return _write_bundle(path, bundle)
+def load_predictor(bundle, device="cpu"):
+    if isinstance(bundle, (str, Path)):
+        bundle = torch.load(bundle, map_location="cpu", weights_only=False)
+    if bundle["format"] != PREDICTOR_FORMAT:
+        raise ValueError("Expected an embedding GRU predictor checkpoint")
+    predictor = ActionPredictor(bundle["embed_dim"], bundle["hidden_dim"], bundle["use_actions"])
+    predictor.load_state_dict(bundle["model"])
+    return predictor.to(device)
 
 
-def load_stage2_adapter(
-    path,
-    *,
-    device,
-    dtype=None,
-    dit_dim=None,
-    selected_block=None,
-    teacher_contract=None,
-    noise_sampling=None,
-    freeze=False,
-):
-    """Load an Adapter after checking all Stage 2 compatibility fields."""
+def export_stage2_adapter(path, adapter, *, predictor_bundle, selected_block,
+                          teacher_sha256, sigma_max=1.0, noise_sampling=None, **metadata):
+    if predictor_bundle["teacher_sha256"] != teacher_sha256:
+        raise ValueError("Predictor and Adapter must use the same frozen Teacher")
+    return _write_bundle(path, dict(
+        format=FORMAT, model=_state(adapter), dit_dim=adapter.dit_dim,
+        vjepa_dim=adapter.vjepa_dim, hidden_dim=adapter.hidden_dim,
+        target_grid=adapter.target_grid, selected_block=selected_block,
+        predictor=predictor_bundle, teacher_sha256=teacher_sha256,
+        sigma_max=float(sigma_max), noise_sampling=noise_sampling, **metadata,
+    ))
+
+
+def load_stage2_adapter(path, *, device, dtype=None, dit_dim=None, selected_block=None,
+                        noise_sampling=None, freeze=False):
     bundle = torch.load(path, map_location="cpu", weights_only=False)
-    _check_adapter_contract(
-        bundle,
-        dit_dim=dit_dim,
-        selected_block=selected_block,
-        teacher_contract=teacher_contract,
-        noise_sampling=noise_sampling,
-    )
-    adapter = SpatiallyAlignedAdapter(
-        dit_dim=int(bundle["dit_dim"]),
-        vjepa_dim=int(bundle["vjepa_dim"]),
-        hidden_dim=int(bundle.get("hidden_dim", bundle["vjepa_dim"])),
-        target_grid=tuple(bundle["target_grid"]),
-        num_views=int(bundle["num_views"]),
-    )
-    adapter.load_state_dict(bundle["model"], strict=True)
-    adapter.to(device=device)
-    if dtype is not None:
-        adapter.to(dtype=dtype)
+    if bundle["format"] != FORMAT:
+        raise ValueError("Expected an embedding Adapter checkpoint; RSSM Adapters cannot be reused")
+    for key, expected in (("dit_dim", dit_dim), ("selected_block", selected_block),
+                          ("noise_sampling", noise_sampling)):
+        if expected is not None and bundle[key] != expected:
+            raise ValueError(f"Adapter contract mismatch: {key}")
+    adapter = SpatiallyAlignedAdapter(bundle["dit_dim"], bundle["vjepa_dim"],
+                                      bundle["target_grid"], hidden_dim=bundle["hidden_dim"])
+    adapter.load_state_dict(bundle["model"])
+    adapter.to(device=device, dtype=dtype)
     if freeze:
-        adapter.requires_grad_(False)
-        adapter.eval()
+        adapter.requires_grad_(False).eval()
     return adapter
 
 
-def _teacher_metadata(path):
-    bundle = torch.load(path, map_location="cpu", weights_only=False)
-    contract = bundle.get("semantic_teacher")
-    if contract is None:
-        config = bundle.get("config", {})
-        contract = config.get("semantic_teacher") if isinstance(config, Mapping) else None
-    if contract is None:
-        raise ValueError("Teacher bundle has no semantic_teacher contract")
-    return contract
-
-
-def load_stage2_distiller(
-    teacher_bundle,
-    adapter_bundle,
-    device,
-    dtype,
-    *,
-    dit_dim=None,
-    selected_block=None,
-    noise_sampling=None,
-):
-    """Load the frozen Teacher and Adapter used by Phase C."""
-    teacher_contract = _teacher_metadata(teacher_bundle)
+def load_stage2_distiller(teacher_bundle, adapter_bundle, device, dtype, *,
+                          dit_dim=None, selected_block=None, noise_sampling=None):
+    bundle = torch.load(adapter_bundle, map_location="cpu", weights_only=False)
+    if bundle["teacher_sha256"] != teacher_identity(teacher_bundle):
+        raise ValueError("Frozen Teacher differs from the one used to fit the predictor")
     teacher = load_frozen_evaluator(teacher_bundle, device=device, dtype=dtype)
-    adapter = load_stage2_adapter(
-        adapter_bundle,
-        device=device,
-        dtype=dtype,
-        dit_dim=dit_dim,
-        selected_block=selected_block,
-        teacher_contract=teacher_contract,
-        noise_sampling=noise_sampling,
-        freeze=True,
-    )
-    distiller = TemporalSemanticDistillation(teacher, adapter, history_groups=HISTORY_GROUPS)
-    distiller.freeze_adapter()
-    return distiller
+    adapter = load_stage2_adapter(adapter_bundle, device=device, dtype=dtype,
+                                  dit_dim=dit_dim, selected_block=selected_block,
+                                  noise_sampling=noise_sampling, freeze=True)
+    predictor = load_predictor(bundle["predictor"], device=device)
+    return TemporalSemanticDistillation(teacher, adapter, predictor, bundle["sigma_max"]).freeze_adapter()

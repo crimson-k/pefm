@@ -130,7 +130,7 @@ def build_RGB_dataloader(bwm_dataset, time_division_factor, batch_size=4, shuffl
     )
 
 
-def stage2_teacher_batch(rgb, eef, time_division_factor=4, action_delta_stats=None):
+def stage2_teacher_batch(rgb, eef, time_division_factor=4):
     """Build the 21-step frozen-Teacher input from one BWM training sample."""
     if rgb.ndim == 5:
         rgb = rgb.unsqueeze(0)
@@ -145,19 +145,14 @@ def stage2_teacher_batch(rgb, eef, time_division_factor=4, action_delta_stats=No
             torch.arange(time_division_factor, eef.shape[1], time_division_factor, device=eef.device),
         ))
         grouped_eef = eef[:, endpoints]
-    elif eef.shape[1] == 1 + (rgb.shape[3] - 1) // time_division_factor:
-        grouped_eef = eef
     else:
-        raise ValueError(
-            f"EEF length {eef.shape[1]} is neither frame length {rgb.shape[3]} "
-            "nor grouped length"
-        )
-    groups = grouped_eef.shape[1]
+        raise ValueError("Stage 2 requires all frame-level EEF poses to preserve action order")
+    frame_actions = relative_eef_actions(eef)
+    segments = frame_actions[:, 1:].reshape(eef.shape[0], -1, time_division_factor, 14)
+    segments = torch.cat((torch.zeros_like(segments[:, :1]), segments), dim=1)
     return {
         "rgb": rgb,
+        "action_segments": segments,
+        "eef": grouped_eef,
         "group_ids": group_ids.expand(rgb.shape[0], -1),
-        "action_delta": normalize_action_delta(
-            relative_eef_actions(grouped_eef), action_delta_stats,
-        ),
-        "reset": (torch.arange(groups, device=rgb.device) == 0).expand(rgb.shape[0], -1),
     }

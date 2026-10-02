@@ -137,8 +137,8 @@ def test_dit_hidden_rssm_flow():
     assert hidden.shape == (1, 6300, 3072)
 
     observation = DiTHiddenObservation(dit_dim=3072, token_dim=192, embed_dim=256)
-    grid = observation.project_grid(hidden, dit_grid=(21, 15, 20), valid_len=6300)
-    spatial = observation(hidden, dit_grid=(21, 15, 20), valid_len=6300)
+    grid = observation.project_grid(hidden, dit_grid=(21, 15, 20), sigma=torch.tensor([0.5]), valid_len=6300)
+    spatial = observation(hidden, dit_grid=(21, 15, 20), sigma=torch.tensor([0.5]), valid_len=6300)
     assert grid.shape == (1, 21, 15, 20, 192)
     assert spatial.shape == (1, 21, 1, 15, 20, 192)
     dit_tokens = spatial.flatten(2, 4).contiguous()
@@ -172,11 +172,11 @@ def test_spatial_adapter_requires_explicit_view_layout():
         dit_dim=32, vjepa_dim=8, target_grid=(15, 20), num_views=2, hidden_dim=32,
     )
     hidden = torch.randn(1, 21 * 60 * 40, 32)
-    tokens = adapter(hidden, dit_grid=(21, 60, 40))
+    tokens = adapter(hidden, dit_grid=(21, 60, 40), sigma=torch.tensor([0.5]))
     assert tokens.shape == (1, 21, 2, 15, 20, 8)
     assert not hasattr(adapter, "aggregator")
     with pytest.raises(ValueError, match="not divisible"):
-        adapter(hidden, dit_grid=(21, 60, 40), num_views=7)
+        adapter(hidden, dit_grid=(21, 60, 40), sigma=torch.tensor([0.5]), num_views=7)
 
 
 if __name__ == "__main__":

@@ -1,382 +1,140 @@
-"""Phase-B training entry point for the PEFM SpatiallyAlignedAdapter.
-
-The manifest points to ``.pt`` files produced by the BWM-side hidden capture.
-Each file contains ``hidden``, ``dit_grid``, ``valid_len`` and either a nested
-``teacher_batch`` or the four Teacher batch fields directly.
-"""
+"""阶段 B：固定视觉目标和预测器，先对齐当前特征，再加入未来预测。"""
 
 import argparse
 import json
-import os
-from collections.abc import Mapping
 from pathlib import Path
 
 import torch
-from accelerate import Accelerator
-from omegaconf import OmegaConf
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset, DataLoader
 
-from pefm.export import export_stage2_adapter, load_frozen_evaluator
+from pefm.export import load_frozen_evaluator
+from pefm.export.stage2 import export_stage2_adapter, load_predictor, teacher_identity
 from pefm.models import SpatiallyAlignedAdapter, TemporalSemanticDistillation
 
 
-REQUIRED_TEACHER_FIELDS = ("rgb", "group_ids", "action_delta", "reset")
-
-
 class HiddenBatchDataset(Dataset):
-    """Read one serialized hidden/GT batch per manifest line."""
-
     def __init__(self, manifest):
         manifest = Path(manifest)
-        root = manifest.parent
-        self.paths = []
-        with manifest.open(encoding="utf-8") as file:
-            for line in file:
-                line = line.strip()
-                if line:
-                    record = json.loads(line)
-                    path = record["path"] if isinstance(record, dict) else record
-                    path = Path(path)
-                    self.paths.append(str(path if path.is_absolute() else root / path))
+        records = [json.loads(line) for line in manifest.read_text().splitlines() if line.strip()]
+        self.paths = [manifest.parent / (r["path"] if isinstance(r, dict) else r) for r in records]
         if not self.paths:
-            raise ValueError(f"Empty Stage 2 hidden manifest: {manifest}")
+            raise ValueError(f"Empty manifest: {manifest}")
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, index):
-        payload = torch.load(self.paths[index], map_location="cpu", weights_only=False)
-        if not isinstance(payload, dict):
-            raise TypeError(f"Expected a dict hidden batch, got {type(payload).__name__}")
-        return payload
+        return torch.load(self.paths[index], map_location="cpu", weights_only=False)
 
 
 def _move(value, device):
     if torch.is_tensor(value):
         return value.to(device)
     if isinstance(value, dict):
-        return {key: _move(item, device) for key, item in value.items()}
+        return {k: _move(v, device) for k, v in value.items()}
     return value
 
 
-def _unpack_batch(batch):
-    hidden = batch["hidden"]
-    teacher_batch = batch.get("teacher_batch")
-    if teacher_batch is None:
-        teacher_batch = {key: batch[key] for key in REQUIRED_TEACHER_FIELDS}
-    if "dit_grid" not in batch or "valid_len" not in batch:
-        raise KeyError("Stage 2 hidden batches must provide dit_grid and valid_len explicitly")
-    dit_grid = tuple(int(value) for value in batch["dit_grid"])
-    valid_len = int(batch["valid_len"])
-    num_views = int(batch.get("num_views", 1))
-    return hidden, dit_grid, valid_len, num_views, teacher_batch
+def loader(manifest, shuffle=False):
+    return DataLoader(HiddenBatchDataset(manifest), batch_size=None, shuffle=shuffle)
 
 
-def _scalar_metrics(result):
-    values = {}
-    for name, value in result.items():
-        if torch.is_tensor(value) and value.ndim == 0:
-            values[name] = float(value.detach().cpu())
-    return values
-
-
-def run_adapter_epoch(
-    distiller, loader, device, optimizer=None,
-    token_scale=0.0, embedding_scale=1.0, posterior_scale=1.0,
-    accelerator=None,
-):
-    """Run one Phase-B epoch and return averaged loss/diagnostic scalars."""
+def run_adapter_epoch(model, batches, device, pred_weight, optimizer=None,
+                      selected_block=None, noise_sampling=None):
     training = optimizer is not None
-    distiller.train(training)
+    model.train(training)
     totals, count = {}, 0
-    for raw_batch in loader:
-        batch = _move(raw_batch, device)
-        hidden, dit_grid, valid_len, num_views, teacher_batch = _unpack_batch(batch)
-        hidden = hidden.detach()  # Phase B keeps Wan DiT outside the optimizer.
-        if training:
-            optimizer.zero_grad()
+    for raw in batches:
+        batch = _move(raw, device)
+        if selected_block is not None and batch["selected_block"] != selected_block:
+            raise ValueError("Captured hidden uses a different DiT block")
+        if noise_sampling is not None and batch["noise_sampling"] != noise_sampling:
+            raise ValueError("Captured noise distribution differs from Phase B/C contract")
+        sigma = batch["noise_sigma"]
         with torch.set_grad_enabled(training):
-            result = distiller(
-                hidden=hidden,
-                dit_grid=dit_grid,
-                valid_len=valid_len,
-                teacher_batch=teacher_batch,
-                num_views=num_views,
-                phase="adapter",
-                token_scale=token_scale,
-                embedding_scale=embedding_scale,
-                posterior_scale=posterior_scale,
-            )
-        losses = result["adapter"]
-        if training:
-            if accelerator is None:
-                losses["total"].backward()
-            else:
-                accelerator.backward(losses["total"])
-            optimizer.step()
-        scalar_metrics = _scalar_metrics(losses)
-        if accelerator is None:
-            for name, value in scalar_metrics.items():
-                totals[name] = totals.get(name, 0.0) + value
-            count += 1
-        else:
-            names = list(scalar_metrics)
-            values = torch.stack([losses[name].detach().float() for name in names]).unsqueeze(0)
-            gathered = accelerator.gather_for_metrics(values)
-            for name, value in zip(names, gathered.sum(0).cpu().tolist()):
-                totals[name] = totals.get(name, 0.0) + value
-            count += gathered.shape[0]
+            result = model(batch["hidden"].detach(), batch["dit_grid"], batch["teacher_batch"],
+                           sigma, batch["valid_len"])
+            loss = result["align"] + pred_weight * result["pred"]
+            if training and float(result["active_fraction"]) > 0:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+        with torch.no_grad():
+            pred = model.predictor
+            estimate, target = result["estimated"], result["target"]
+            clean_prediction = pred.pairs(target, batch["teacher_batch"]["action_segments"]).squeeze(2)
+            metrics = {
+                "align": result["align"], "pred": result["pred"], "total": loss,
+                "active_fraction": result["active_fraction"],
+                "paired_mse": pred.distance(estimate[:, 3:20], target[:, 3:20]).mean(),
+                "shuffled_mse": pred.distance(estimate[:, 3:20], target[:, 3:20].roll(1, 1)).mean(),
+                "gt_start_pred_mse": pred.distance(clean_prediction, target[:, 4:21]).mean(),
+                "estimated_start_pred_mse": result["pred_per_step"].mean(),
+            }
+            # capture 当前每条记录只含一个噪声量，按固定三档分别报告读出误差。
+            noise_bin = min(int(float(sigma.float().mean()) * 3), 2)
+            metrics[f"sigma_bin_{noise_bin}_paired"] = metrics["paired_mse"]
+            metrics[f"sigma_bin_{noise_bin}_shuffled"] = metrics["shuffled_mse"]
+            for name, value in metrics.items():
+                total, n = totals.get(name, (0., 0))
+                totals[name] = (total + float(value), n + 1)
+        count += 1
     if not count:
-        raise ValueError("Stage 2 Adapter epoch received no batches")
-    return {name: value / count for name, value in totals.items()}
-
-
-def _teacher_contract(bundle_path):
-    bundle = torch.load(bundle_path, map_location="cpu", weights_only=False)
-    contract = bundle.get("semantic_teacher")
-    if contract is None:
-        config = bundle.get("config", {})
-        contract = config.get("semantic_teacher") if isinstance(config, Mapping) else None
-    if contract is None:
-        raise ValueError("Teacher bundle has no semantic_teacher contract")
-    return contract
-
-
-def _write_selection(path, *, best_path, last_path, best_epoch, last_epoch, best_score):
-    selection = {
-        "best_path": Path(best_path).name,
-        "last_path": Path(last_path).name,
-        "best_epoch": int(best_epoch),
-        "last_epoch": int(last_epoch),
-        "best_score": float(best_score),
-    }
-    temporary = str(path) + ".tmp"
-    Path(temporary).write_text(json.dumps(selection, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
-
-
-def train_adapter(
-    teacher_bundle,
-    train_loader,
-    output,
-    *,
-    dit_dim,
-    selected_block,
-    device,
-    dtype,
-    epochs=1,
-    lr=1e-4,
-    weight_decay=0.01,
-    valid_loader=None,
-    noise_sampling=None,
-    target_grid=(12, 16),
-    num_views=1,
-    hidden_dim=None,
-    token_scale=0.0,
-    embedding_scale=1.0,
-    posterior_scale=1.0,
-    prior_metric_scale=1.0,
-    accelerator=None,
-):
-    """Train and export the best Adapter using a caller-provided DataLoader."""
-    teacher_contract = _teacher_contract(teacher_bundle)
-    expected_grid = tuple(teacher_contract.get("aligned_grid", target_grid))
-    if tuple(target_grid) != expected_grid or int(num_views) != 1:
-        raise ValueError(
-            "Phase B requires one view and target_grid matching the Teacher grid "
-            f"{expected_grid}"
-        )
-    teacher = load_frozen_evaluator(teacher_bundle, device=device, dtype=dtype)
-    adapter = SpatiallyAlignedAdapter(
-        dit_dim=dit_dim,
-        vjepa_dim=1408,
-        target_grid=target_grid,
-        num_views=num_views,
-        hidden_dim=hidden_dim,
-    ).to(device=device, dtype=dtype)
-    distiller = TemporalSemanticDistillation(teacher, adapter, history_groups=3)
-    optimizer = torch.optim.AdamW(
-        adapter.parameters(), lr=lr, weight_decay=weight_decay,
-    )
-    if accelerator is not None:
-        if valid_loader is None:
-            distiller, optimizer, train_loader = accelerator.prepare(
-                distiller, optimizer, train_loader,
-            )
-        else:
-            distiller, optimizer, train_loader, valid_loader = accelerator.prepare(
-                distiller, optimizer, train_loader, valid_loader,
-            )
-    output = Path(output)
-    if accelerator is None or accelerator.is_main_process:
-        output.mkdir(parents=True, exist_ok=True)
-    if accelerator is not None:
-        accelerator.wait_for_everyone()
-    best_score = None
-    best_epoch = None
-    best_path = None
-    last_path = output / f"adapter_epoch_{int(epochs):04d}.pt"
-    for epoch in range(1, int(epochs) + 1):
-        train_metrics = run_adapter_epoch(
-            distiller, train_loader, device, optimizer,
-            token_scale=token_scale,
-            embedding_scale=embedding_scale,
-            posterior_scale=posterior_scale,
-            accelerator=accelerator,
-        )
-        valid_metrics = None
-        if valid_loader is not None:
-            with torch.no_grad():
-                valid_metrics = run_adapter_epoch(
-                    distiller, valid_loader, device,
-                    token_scale=token_scale,
-                    embedding_scale=embedding_scale,
-                    posterior_scale=posterior_scale,
-                    accelerator=accelerator,
-                )
-        metrics = valid_metrics or train_metrics
-        score = metrics["correct_cosine"] - max(
-            metrics["shuffled_spatial_cosine"], metrics["shuffled_time_view_cosine"],
-        ) + prior_metric_scale * metrics["next_prior_cosine"]
-        message = f"[adapter] epoch={epoch} train={train_metrics} valid={valid_metrics} score={score:.6f}"
-        if accelerator is None:
-            print(message, flush=True)
-        else:
-            accelerator.print(message)
-        exported_adapter = (
-            accelerator.unwrap_model(distiller).adapter
-            if accelerator is not None else adapter
-        )
-        is_main_process = accelerator is None or accelerator.is_main_process
-        if best_score is None or score > best_score:
-            new_best_path = output / f"adapter_epoch_{epoch:04d}.pt"
-            best_score = score
-            best_epoch = epoch
-            if is_main_process:
-                if best_path is not None and best_path != new_best_path and best_path.exists():
-                    best_path.unlink()
-                export_stage2_adapter(
-                    new_best_path,
-                    exported_adapter,
-                    selected_block=selected_block,
-                    teacher_contract=teacher_contract,
-                    noise_sampling=noise_sampling,
-                    epoch=epoch,
-                    metrics={"train": train_metrics, "valid": valid_metrics},
-                )
-            best_path = new_best_path
-        if accelerator is not None:
-            accelerator.wait_for_everyone()
-    if is_main_process and last_path != best_path:
-        export_stage2_adapter(
-            last_path,
-            exported_adapter,
-            selected_block=selected_block,
-            teacher_contract=teacher_contract,
-            noise_sampling=noise_sampling,
-            epoch=int(epochs),
-            metrics={"train": train_metrics, "valid": valid_metrics},
-        )
-    if is_main_process:
-        _write_selection(
-            output / "adapter_selection.json",
-            best_path=best_path,
-            last_path=last_path,
-            best_epoch=best_epoch,
-            last_epoch=int(epochs),
-            best_score=best_score,
-        )
-    if accelerator is not None:
-        accelerator.wait_for_everyone()
-    return best_path
+        raise ValueError("No Adapter batches")
+    metrics = {k: value / n for k, (value, n) in totals.items()}
+    if metrics["active_fraction"] == 0:
+        raise ValueError("No captures in the configured auxiliary sigma interval")
+    return metrics
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train the PEFM Stage-2 Adapter.")
-    parser.add_argument("--config", default=None, help="YAML config; explicit CLI values override it.")
-    parser.add_argument("--teacher-bundle", default=None)
-    parser.add_argument("--train-manifest", default=None)
-    parser.add_argument("--valid-manifest", default=None)
-    parser.add_argument("--output", default=None)
-    parser.add_argument("--dit-dim", type=int, default=None)
-    parser.add_argument("--selected-block", type=int, default=None)
-    parser.add_argument("--device", default=None)
-    parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"), default=None)
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--weight-decay", type=float, default=None)
-    parser.add_argument("--target-grid", type=int, nargs=2, default=None)
-    parser.add_argument("--num-views", type=int, default=None)
-    parser.add_argument("--hidden-dim", type=int, default=None)
-    parser.add_argument("--noise-sampling", default=None,
-                        help="Optional JSON object overriding the config contract.")
-    parser.add_argument("--token-scale", type=float, default=None)
-    parser.add_argument("--embedding-scale", type=float, default=None)
-    parser.add_argument("--posterior-scale", type=float, default=None)
-    parser.add_argument("--prior-metric-scale", type=float, default=None)
-    parser.add_argument("--mixed-precision", choices=("no", "fp16", "bf16"), default=None)
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("teacher-bundle", "predictor-bundle", "train-manifest", "valid-manifest", "output"):
+        parser.add_argument("--" + name, required=True)
+    parser.add_argument("--dit-dim", type=int, required=True)
+    parser.add_argument("--selected-block", type=int, required=True)
+    parser.add_argument("--noise-sampling", type=json.loads, required=True)
+    parser.add_argument("--sigma-max", type=float, default=1.)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--align-epochs", type=int, default=2)
+    parser.add_argument("--pred-weight", type=float, default=1.)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    config = {}
-    if args.config:
-        config = OmegaConf.to_container(OmegaConf.load(args.config), resolve=True) or {}
-    values = dict(config)
-    values.update({key: value for key, value in vars(args).items()
-                   if key != "config" and value is not None})
-    defaults = {
-        "device": "cuda", "dtype": "bfloat16", "epochs": 1,
-        "lr": 1e-4, "weight_decay": 0.01, "target_grid": [12, 16],
-        "num_views": 1, "hidden_dim": None, "noise_sampling": None,
-        "token_scale": 0.0, "embedding_scale": 1.0, "posterior_scale": 1.0,
-        "prior_metric_scale": 1.0,
-        "mixed_precision": "bf16",
-    }
-    for key, value in defaults.items():
-        values.setdefault(key, value)
-    required = ("teacher_bundle", "train_manifest", "output", "dit_dim", "selected_block")
-    missing = [key for key in required if values.get(key) is None]
-    if missing:
-        parser.error("missing required settings: " + ", ".join(missing))
-    if int(values.get("history_groups", 3)) != 3:
-        parser.error("Stage 2 requires history_groups=3")
-    if args.noise_sampling:
-        values["noise_sampling"] = json.loads(args.noise_sampling)
-    dtype = getattr(torch, values["dtype"])
-    accelerator = Accelerator(mixed_precision=values["mixed_precision"])
-    train_loader = DataLoader(
-        HiddenBatchDataset(values["train_manifest"]), batch_size=1, shuffle=True,
-        collate_fn=lambda items: items[0],
-    )
-    valid_loader = None
-    if values.get("valid_manifest"):
-        valid_loader = DataLoader(
-            HiddenBatchDataset(values["valid_manifest"]), batch_size=1, shuffle=False,
-            collate_fn=lambda items: items[0],
-        )
-    train_adapter(
-        values["teacher_bundle"],
-        train_loader,
-        values["output"],
-        dit_dim=int(values["dit_dim"]),
-        selected_block=int(values["selected_block"]),
-        device=accelerator.device,
-        dtype=dtype,
-        epochs=int(values["epochs"]),
-        lr=float(values["lr"]),
-        weight_decay=float(values["weight_decay"]),
-        target_grid=tuple(values["target_grid"]),
-        num_views=int(values["num_views"]),
-        hidden_dim=values["hidden_dim"],
-        noise_sampling=values["noise_sampling"],
-        token_scale=float(values["token_scale"]),
-        embedding_scale=float(values["embedding_scale"]),
-        posterior_scale=float(values["posterior_scale"]),
-        prior_metric_scale=float(values["prior_metric_scale"]),
-        valid_loader=valid_loader,
-        accelerator=accelerator,
-    )
-    accelerator.wait_for_everyone()
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
+    if not 0 < args.align_epochs < args.epochs or not 0 < args.sigma_max <= 1:
+        parser.error("Require 0 < align-epochs < epochs and 0 < sigma-max <= 1")
+    torch.manual_seed(args.seed)
+    identity = teacher_identity(args.teacher_bundle)
+    predictor_bundle = torch.load(args.predictor_bundle, map_location="cpu", weights_only=False)
+    if predictor_bundle["teacher_sha256"] != identity:
+        raise ValueError("Predictor was fitted to a different frozen Teacher")
+    teacher = load_frozen_evaluator(args.teacher_bundle, device=args.device, dtype=torch.float32)
+    token_dim = teacher.token_aggregator.attn.kdim
+    adapter = SpatiallyAlignedAdapter(args.dit_dim, token_dim, teacher.aligned_grid).to(args.device)
+    model = TemporalSemanticDistillation(teacher, adapter, load_predictor(predictor_bundle, args.device),
+                                         args.sigma_max)
+    del teacher
+    optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr)
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    best = float("inf")
+    for epoch in range(1, args.epochs + 1):
+        weight = 0. if epoch <= args.align_epochs else args.pred_weight
+        train = run_adapter_epoch(model, loader(args.train_manifest, True), args.device, weight,
+                                  optimizer, args.selected_block, args.noise_sampling)
+        valid = run_adapter_epoch(model, loader(args.valid_manifest), args.device, args.pred_weight,
+                                  selected_block=args.selected_block, noise_sampling=args.noise_sampling)
+        record = {"epoch": epoch, "pred_weight": weight, "train": train, "valid": valid}
+        print(json.dumps(record), flush=True)
+        with (output / "metrics.jsonl").open("a") as f:
+            f.write(json.dumps(record) + "\n")
+        if epoch > args.align_epochs and valid["total"] < best:
+            best = valid["total"]
+            export_stage2_adapter(output / "adapter_best.pt", adapter,
+                                  predictor_bundle=predictor_bundle, selected_block=args.selected_block,
+                                  teacher_sha256=identity, sigma_max=args.sigma_max,
+                                  noise_sampling=args.noise_sampling, epoch=epoch, metrics=record)
 
 
 if __name__ == "__main__":

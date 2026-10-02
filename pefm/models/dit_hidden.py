@@ -1,5 +1,6 @@
 """Position-preserving projection from Wan DiT tokens to V-JEPA tokens."""
 
+import torch
 from torch import nn
 
 
@@ -49,6 +50,7 @@ class SpatiallyAlignedAdapter(nn.Module):
         self.num_views = int(num_views)
         hidden_dim = int(hidden_dim or vjepa_dim)
         self.hidden_dim = hidden_dim
+        self.noise_embedding = nn.Linear(1, dit_dim)
         self.proj = nn.Sequential(
             nn.LayerNorm(dit_dim),
             nn.Linear(dit_dim, hidden_dim),
@@ -76,19 +78,21 @@ class SpatiallyAlignedAdapter(nn.Module):
             )
         return hidden[:, :expected].reshape(hidden.shape[0], time, height, width, hidden.shape[-1])
 
-    def project_grid(self, hidden, dit_grid, valid_len=None):
+    def project_grid(self, hidden, dit_grid, sigma, valid_len=None):
         """Project to the channel-last DiT grid ``[B,T,H,W,vjepa_dim]``."""
         grid = self.restore_grid(hidden, dit_grid, valid_len)
         projection_dtype = self.proj[1].weight.dtype
-        projected = self.proj(grid.to(projection_dtype))
+        sigma = torch.as_tensor(sigma, device=hidden.device, dtype=projection_dtype).reshape(-1, 1)
+        noise = self.noise_embedding(sigma).reshape(-1, 1, 1, 1, self.dit_dim)
+        projected = self.proj(grid.to(projection_dtype) + noise)
         return projected.reshape(
             hidden.shape[0], int(dit_grid[0]), int(dit_grid[1]), int(dit_grid[2]),
             self.vjepa_dim,
         )
 
-    def forward(self, hidden, dit_grid, valid_len=None, num_views=None):
+    def forward(self, hidden, dit_grid, sigma, valid_len=None, num_views=None):
         """Return V-JEPA-style tokens ``[B,T,V,15,20,1408]``."""
-        grid = self.project_grid(hidden, dit_grid, valid_len)
+        grid = self.project_grid(hidden, dit_grid, sigma, valid_len)
         views = self.num_views if num_views is None else int(num_views)
         if views < 1 or grid.shape[2] % views:
             raise ValueError(
