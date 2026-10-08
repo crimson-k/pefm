@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from pefm.export import load_frozen_evaluator
+from pefm.export import load_frozen_visual_teacher
 from pefm.export.stage2 import export_stage2_adapter, load_predictor, teacher_identity
 from pefm.models import SpatiallyAlignedAdapter, TemporalSemanticDistillation
 
@@ -109,7 +109,7 @@ def main():
     predictor_bundle = torch.load(args.predictor_bundle, map_location="cpu", weights_only=False)
     if predictor_bundle["teacher_sha256"] != identity:
         raise ValueError("Predictor was fitted to a different frozen Teacher")
-    teacher = load_frozen_evaluator(args.teacher_bundle, device=args.device, dtype=torch.float32)
+    teacher = load_frozen_visual_teacher(args.teacher_bundle, device=args.device, dtype=torch.float32)
     token_dim = teacher.token_aggregator.attn.kdim
     adapter = SpatiallyAlignedAdapter(args.dit_dim, token_dim, teacher.aligned_grid).to(args.device)
     model = TemporalSemanticDistillation(teacher, adapter, load_predictor(predictor_bundle, args.device),

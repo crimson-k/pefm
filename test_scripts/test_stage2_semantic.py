@@ -1,6 +1,7 @@
 """CPU 验证：动作时序、冻结梯度、统计量与 checkpoint 一致性。"""
 
 from pathlib import Path
+import json
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -11,7 +12,7 @@ from torch import nn
 from pefm.data import stage2_teacher_batch
 from pefm.export.stage2 import export_predictor, export_stage2_adapter, load_predictor, load_stage2_adapter
 from pefm.models import ActionPredictor, SpatiallyAlignedAdapter, TemporalSemanticDistillation, TokenAggregator
-from pefm.training.train_predictor import fit_statistics, targets_at_horizon
+from pefm.training.train_predictor import fit_statistics, targets_at_horizon, main, parse_args
 from pefm.training.train_adapter import run_adapter_epoch
 
 
@@ -74,6 +75,18 @@ class SemanticTest(unittest.TestCase):
             self.assertTrue(all(p.grad is None for p in model.parameters()))
             self.assertFalse(output["target"].requires_grad)
 
+    def test_prediction_loss_reaches_dit_parameters(self):
+        model = make_model().freeze_adapter()
+        dit = nn.Linear(3, 5)
+        before = {name: value.clone() for name, value in model.state_dict().items()}
+        result = model(dit(torch.randn(2, 84, 3)), (21, 2, 2), self.batch(),
+                       torch.tensor([.2]), 84)
+        result["pred"].backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all()
+                            and p.grad.norm() > 0 for p in dit.parameters()))
+        self.assertTrue(all(torch.equal(before[name], value)
+                            for name, value in model.state_dict().items()))
+
     def test_adapter_is_group_local_and_sigma_conditioned(self):
         model = make_model()
         hidden = torch.randn(1, 84, 5)
@@ -131,6 +144,41 @@ class SemanticTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 export_stage2_adapter(path / "bad.pt", adapter, predictor_bundle=bundle,
                                       selected_block=15, teacher_sha256="wrong")
+
+    def test_default_training_entry_and_resume(self):
+        # Exercise CLI config overrides, actual Phase A optimization, export,
+        # and continuation. Two held-out trajectories support action shuffling.
+        config = Path(__file__).resolve().parents[1] / "pefm/training/config/train.yaml"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for split in ("train", "valid"):
+                entries = []
+                for index in range(2):
+                    path = root / f"{split}_{index}.pt"
+                    torch.save({"embed": torch.randn(2, 21, 6),
+                                "action_segments": torch.randn(2, 21, 4, 14),
+                                "eef": torch.randn(2, 21, 14), "task": "task",
+                                "teacher_sha256": "teacher"}, path)
+                    entries.append(json.dumps({"path": path.name}))
+                (root / f"{split}.jsonl").write_text("\n".join(entries))
+            argv = ["--config", str(config), "--train-manifest", str(root / "train.jsonl"),
+                    "--valid-manifest", str(root / "valid.jsonl"), "--output", str(root / "out"),
+                    "--device", "cpu", "--hidden-dim", "8", "--epochs", "1"]
+            args = parse_args(argv)
+            self.assertEqual(args.seed, 42)
+            self.assertEqual(args.hidden_dim, 8)
+            main(argv)
+            latest = root / "out/latest.pt"
+            first = torch.load(latest, weights_only=False)
+            self.assertEqual(first["epoch"], 1)
+            self.assertFalse(any("kl" in key for key in first["model"]))
+            argv[-1] = "2"
+            main(argv + ["--resume", str(latest)])
+            resumed = torch.load(latest, weights_only=False)
+            self.assertEqual(resumed["epoch"], 2)
+            self.assertTrue(any(not torch.equal(value, resumed["model"][name])
+                                for name, value in first["model"].items()))
+            torch.testing.assert_close(first["model"]["std"], resumed["model"]["std"])
 
 
 if __name__ == "__main__":

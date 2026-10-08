@@ -5,17 +5,20 @@ import json
 from pathlib import Path
 
 import torch
+from accelerate import Accelerator
+from omegaconf import OmegaConf
 
-from pefm.export import load_frozen_evaluator
-from pefm.export.stage2 import export_predictor, teacher_identity
+from pefm.export import load_frozen_visual_teacher
+from pefm.export.stage2 import export_predictor, load_predictor, teacher_identity
 from pefm.models import ActionPredictor
 from pefm.models.vjepa_adapter import align_row_major_tokens
+from pefm.utils.graceful_exit import GracefulExit
 from .train_adapter import loader, _move
 
 
 @torch.no_grad()
 def cache_targets(args):
-    teacher = load_frozen_evaluator(args.teacher_bundle, device=args.device, dtype=torch.float32)
+    teacher = load_frozen_visual_teacher(args.teacher_bundle, device=args.device, dtype=torch.float32)
     identity = teacher_identity(args.teacher_bundle)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -103,64 +106,170 @@ def motion_probe(train, valid):
             "displacement_mse": float(error[:, 6:].mean()), "displacement_mean_mse": float(baseline[:, 6:].mean())}
 
 
-def main():
+def run_epoch(model, batches, cfg, optimizer, epoch, split, accelerator, stop=None):
+    """Phase A optimizes only standardized future embedding MSE."""
+    training = optimizer is not None
+    model.train(training)
+    core = accelerator.unwrap_model(model)
+    total, count = 0., 0
+    for batch_id, raw in enumerate(batches):
+        record = _move(raw, cfg.device)
+        embedding, actions = record["embed"].detach(), record["action_segments"]
+        horizon = int(cfg.horizon)
+        segments = torch.stack([actions[:, t + 1:t + 1 + horizon]
+                                for t in range(3, 21 - horizon)], dim=1)
+        with torch.set_grad_enabled(training):
+            prediction = model(embedding[:, 3:21 - horizon], segments)
+            loss = core.distance(prediction, targets_at_horizon(embedding, horizon)).mean()
+            if training:
+                optimizer.zero_grad()
+                accelerator.backward(loss)
+                accelerator.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                optimizer.step()
+        total += float(accelerator.reduce(loss.detach(), "mean"))
+        count += 1
+        accelerator.print(f"[{split}] epoch={epoch} batch={batch_id} pred={float(loss.detach()):.5f}",
+                          flush=True)
+        if stop is not None:
+            stop.batch = count
+            if stop.sync():
+                break
+        if cfg.get("max_batches", 0) and count >= cfg.max_batches:
+            break
+    if not count:
+        raise ValueError("No predictor batches")
+    return {"pred": total / count, "total": total / count}
+
+
+def save_state(path, model, optimizer, cfg, epoch, **progress):
+    """A resumable predictor checkpoint never contains visual or stochastic weights."""
+    export_predictor(path, model, cfg.teacher_sha256, epoch=epoch,
+                     horizon=int(cfg.horizon), seed=int(cfg.seed),
+                     optimizer=optimizer.state_dict(),
+                     config=OmegaConf.to_container(cfg, resolve=True), **progress)
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("cache", "train"))
-    for name in ("train-manifest", "output"):
-        parser.add_argument("--" + name, required=True)
-    parser.add_argument("--teacher-bundle")
+    parser.add_argument("phase", nargs="?", choices=("cache", "train"), default="train")
+    parser.add_argument("--config")
+    parser.add_argument("--train-manifest")
     parser.add_argument("--valid-manifest")
+    parser.add_argument("--teacher-bundle")
+    parser.add_argument("--output")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--horizon", type=int, choices=(1, 2, 4), default=1)
-    parser.add_argument("--no-actions", action="store_true")
+    action_mode = parser.add_mutually_exclusive_group()
+    action_mode.add_argument("--no-actions", dest="no_actions", action="store_true")
+    action_mode.add_argument("--actions", dest="no_actions", action="store_false")
+    parser.set_defaults(no_actions=False)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=.01)
+    parser.add_argument("--max-grad-norm", type=float, default=.5)
     parser.add_argument("--seed", type=int, default=0)
-    args = parser.parse_args()
+    parser.add_argument("--resume")
+    parser.add_argument("--max-batches", type=int, default=0)
+    config_arg, _ = parser.parse_known_args(argv)
+    if config_arg.config:
+        config = OmegaConf.to_container(OmegaConf.load(config_arg.config), resolve=True)
+        allowed = {action.dest for action in parser._actions}
+        unknown = set(config) - allowed
+        if unknown:
+            parser.error(f"Unsupported Stage 2 config keys: {sorted(unknown)}. "
+                         "Use the fixed-embedding predictor config, not the old Teacher config.")
+        parser.set_defaults(**config)
+    args = parser.parse_args(argv)
+    if not args.train_manifest or not args.output:
+        parser.error("--train-manifest and --output are required")
+    if args.phase == "cache" and not args.teacher_bundle:
+        parser.error("cache requires --teacher-bundle")
+    if args.phase == "train" and not args.valid_manifest:
+        parser.error("train requires --valid-manifest")
+    if args.phase not in ("cache", "train"):
+        parser.error("phase must be cache or train")
+    if args.horizon not in (1, 2, 4) or args.epochs < 1 or args.hidden_dim < 1:
+        parser.error("Require horizon in {1,2,4}, epochs >= 1 and hidden-dim >= 1")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
     torch.manual_seed(args.seed)
     if args.phase == "cache":
-        if not args.teacher_bundle:
-            parser.error("cache requires --teacher-bundle")
         cache_targets(args)
         return
-    if not args.valid_manifest:
-        parser.error("train requires --valid-manifest")
     train, valid = list(loader(args.train_manifest)), list(loader(args.valid_manifest))
     identity = train[0]["teacher_sha256"]
     if any(r["teacher_sha256"] != identity for r in train + valid):
         raise ValueError("All target caches must use the same frozen Teacher")
-    model = ActionPredictor(train[0]["embed"].shape[-1], args.hidden_dim, not args.no_actions)
-    statistics = fit_statistics(model, train)
-    probe = motion_probe(train, valid)
-    print(json.dumps({"statistics": statistics, "motion_probe": probe}), flush=True)
-    model.to(args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    cfg = OmegaConf.create(vars(args))
+    cfg.teacher_sha256 = identity
+    accelerator = Accelerator(cpu=args.device == "cpu")
+    cfg.device = str(accelerator.device)
+    stop = GracefulExit(accelerator)
+    resume = torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
+    if resume:
+        if resume["teacher_sha256"] != identity or resume["horizon"] != args.horizon:
+            raise ValueError("Resume requires the same Teacher and prediction horizon")
+        if resume["hidden_dim"] != args.hidden_dim or resume["use_actions"] != (not args.no_actions):
+            raise ValueError("Resume predictor architecture differs from config")
+        if resume["embed_dim"] != train[0]["embed"].shape[-1]:
+            raise ValueError("Resume embedding dimension differs from target caches")
+        model = load_predictor(resume)
+        cfg.seed = int(resume["seed"])
+        torch.manual_seed(cfg.seed)
+        statistics = resume["config"]["statistics"]
+        probe = resume["config"]["motion_probe"]
+    else:
+        model = ActionPredictor(train[0]["embed"].shape[-1], args.hidden_dim, not args.no_actions)
+        statistics = fit_statistics(model, train)
+        probe = motion_probe(train, valid)
+    cfg.statistics, cfg.motion_probe = statistics, probe
+    accelerator.print(json.dumps({"statistics": statistics, "motion_probe": probe}), flush=True)
+    model.to(cfg.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    start_epoch = 0
+    if resume:
+        optimizer.load_state_dict(resume["optimizer"])
+        start_epoch = int(resume["epoch"])
+    train_loader, valid_loader = loader(args.train_manifest, True), loader(args.valid_manifest)
+    model, optimizer, train_loader, valid_loader = accelerator.prepare(
+        model, optimizer, train_loader, valid_loader)
     output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
-    best = float("inf")
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        losses = []
-        for index in torch.randperm(len(train)).tolist():
-            record = _move(train[index], args.device)
-            prediction = model.pairs(record["embed"], record["action_segments"], args.horizon)
-            loss = model.distance(prediction, targets_at_horizon(record["embed"], args.horizon)).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            losses.append(float(loss.detach()))
-        model.eval()
-        metrics = evaluate(model, valid, args.horizon)
-        message = {"epoch": epoch, "train": sum(losses) / len(losses), "valid": metrics}
-        print(json.dumps(message), flush=True)
-        with (output / "metrics.jsonl").open("a") as file:
-            file.write(json.dumps(message) + "\n")
-        if metrics["prediction"] < best:
-            best = metrics["prediction"]
-            export_predictor(output / "predictor_best.pt", model, identity,
-                              epoch=epoch, horizon=args.horizon, metrics=message,
-                              statistics=statistics, motion_probe=probe, seed=args.seed)
+    if accelerator.is_main_process:
+        output.mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(cfg, output / "resolved_config.yaml", resolve=True)
+    accelerator.wait_for_everyone()
+    best = float(resume["config"].get("best", float("inf"))) if resume else float("inf")
+    for epoch in range(start_epoch, args.epochs):
+        train_metrics = run_epoch(model, train_loader, cfg, optimizer, epoch, "train", accelerator, stop)
+        if stop.requested:
+            stop.save(output, model, optimizer, cfg, epoch, "train", save_state)
+            break
+        valid_metrics = run_epoch(model, valid_loader, cfg, None, epoch, "val", accelerator, stop)
+        if stop.requested:
+            stop.save(output, model, optimizer, cfg, epoch, "val", save_state)
+            break
+        core = accelerator.unwrap_model(model)
+        diagnostics = evaluate(core, valid, args.horizon)
+        record = {"epoch": epoch + 1, "train": train_metrics, "valid": valid_metrics,
+                  "diagnostics": diagnostics}
+        improved = diagnostics["prediction"] < best
+        best = min(best, diagnostics["prediction"])
+        cfg.best = best
+        if accelerator.is_main_process:
+            print(json.dumps(record), flush=True)
+            with (output / "metrics.jsonl").open("a") as file:
+                file.write(json.dumps(record) + "\n")
+            save_state(output / "latest.pt", core, optimizer, cfg, epoch + 1)
+            if improved:
+                export_predictor(output / "predictor_best.pt", core, identity,
+                                 epoch=epoch + 1, horizon=args.horizon, metrics=record,
+                                 statistics=statistics, motion_probe=probe, seed=cfg.seed)
+        accelerator.wait_for_everyone()
+    accelerator.end_training()
 
 
 if __name__ == "__main__":

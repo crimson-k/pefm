@@ -1,27 +1,16 @@
-dataset: "/data1/fangxuebin/boundless-world-model/converted_dataset_bwm_6tasks_320x240"
-vjepa_checkpoint: "/data1/fangxuebin/models/vjepa2/vjepa2-ac-vitg.pt"
-output: "outputs/evaluator/soft_6tasks_epoch_100"
-resume: null
-init_checkpoint: null
-checkpoint_every: 50
-device: "cuda:0"
-epochs: 100
-batch_size: 4
-workers: 0
-seed: 42
-lr: 4e-5
+# Stage 2 Phase A: train against caches of V-JEPA + the frozen Aggregator.
+# Set train_manifest and valid_manifest here, or supply CLI overrides.
+phase: train
+train_manifest: null
+valid_manifest: null
+output: outputs/stage2/predictor
+device: cuda
+epochs: 30
+hidden_dim: 256
+horizon: 1
+no_actions: false
+lr: 1e-4
 weight_decay: 0.01
 max_grad_norm: 0.5
-max_batches: 0
-freeze_aggregator_epoch: 10
-
-eval_mode: False
-
-rssm_model_size: "src/r2dreamer/configs/model/size12M.yaml"
-
-freeze:
-  - "vjepa_adapter.encoder"
-  # - "token_aggregator"
-  # - "rssm"
-  # - "posterior_reconstruction_head"
-  # - "prior_prediction_head"
+seed: 42
+resume: null

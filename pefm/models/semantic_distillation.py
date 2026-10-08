@@ -7,7 +7,7 @@ from .vjepa_adapter import align_row_major_tokens
 
 TIME_GROUPS = 21
 HISTORY_GROUPS = 3
-VALID_PRIOR_STEPS = 17
+VALID_PREDICTION_STEPS = 17
 TARGET_GRID = (15, 20)
 
 

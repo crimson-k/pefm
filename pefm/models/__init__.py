@@ -1,6 +1,5 @@
-from .factory import build_evaluator
+from .factory import build_evaluator, build_visual_teacher
 from .dit_hidden import DiTHiddenObservation, SpatiallyAlignedAdapter
-from .rssm_core import RSSM
 from .semantic_distillation import (
     TemporalSemanticDistillation,
     ActionPredictor,
@@ -11,10 +10,10 @@ from .vjepa_adapter import (
     align_row_major_tokens,
     row_major_token_grid,
 )
-from .vjepa_rssm import VJEPARSSMEvaluator
+from .visual_teacher import VisualTeacher
 
 __all__ = [
-    "RSSM", "TokenAggregator", "VJEPAObservationAdapter", "VJEPARSSMEvaluator",
+    "VisualTeacher", "TokenAggregator", "VJEPAObservationAdapter", "build_visual_teacher",
     "align_row_major_tokens", "row_major_token_grid", "build_evaluator", "DiTHiddenObservation",
     "TemporalSemanticDistillation", "ActionPredictor",
     "SpatiallyAlignedAdapter",

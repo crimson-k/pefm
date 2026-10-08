@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 
 from pefm.models import ActionPredictor, SpatiallyAlignedAdapter, TemporalSemanticDistillation
-from .frozen import load_frozen_evaluator
+from .frozen import load_frozen_visual_teacher
 
 FORMAT = "pefm-embedding-adapter-v1"
 PREDICTOR_FORMAT = "pefm-embedding-predictor-v1"
@@ -88,7 +88,7 @@ def load_stage2_distiller(teacher_bundle, adapter_bundle, device, dtype, *,
     bundle = torch.load(adapter_bundle, map_location="cpu", weights_only=False)
     if bundle["teacher_sha256"] != teacher_identity(teacher_bundle):
         raise ValueError("Frozen Teacher differs from the one used to fit the predictor")
-    teacher = load_frozen_evaluator(teacher_bundle, device=device, dtype=dtype)
+    teacher = load_frozen_visual_teacher(teacher_bundle, device=device, dtype=dtype)
     adapter = load_stage2_adapter(adapter_bundle, device=device, dtype=dtype,
                                   dit_dim=dit_dim, selected_block=selected_block,
                                   noise_sampling=noise_sampling, freeze=True)
