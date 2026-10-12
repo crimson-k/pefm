@@ -85,10 +85,13 @@ class TemporalSemanticDistillation(nn.Module):
         self.adapter.requires_grad_(False).eval()
         return self
 
-    def forward(self, hidden, dit_grid, teacher_batch, sigma, valid_len, num_views=1):
+    def forward(self, hidden, dit_grid, teacher_batch, sigma, valid_len, num_views=1,
+                target_embedding=None):
         if int(dit_grid[0]) != TIME_GROUPS or num_views != 1:
             raise ValueError("Stage 2 requires 21 groups and one view")
-        target = self.teacher_targets(teacher_batch)
+        # B/C 复用与教师身份、计算精度、视频和采样帧一致的固定目标。
+        target = (self.teacher_targets(teacher_batch) if target_embedding is None
+                  else target_embedding.detach())
         tokens = self.adapter(hidden, dit_grid, sigma, valid_len, num_views)
         dtype = next(self.aggregator.parameters()).dtype
         estimated = self.aggregator(tokens.flatten(2, 4).to(dtype))
@@ -98,5 +101,5 @@ class TemporalSemanticDistillation(nn.Module):
         active = (torch.as_tensor(sigma, device=hidden.device).reshape(-1, 1) <= self.sigma_max).float()
         return {"align": (align * active).mean(), "pred": (pred * active).mean(),
                 "align_per_step": align, "pred_per_step": pred,
-                "estimated": estimated, "target": target,
+                "estimated": estimated, "target": target, "predicted": predicted,
                 "active_fraction": active.mean()}

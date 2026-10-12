@@ -33,11 +33,11 @@ def _state(model):
     return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
 
-def export_predictor(path, predictor, teacher_sha256, **metadata):
+def export_predictor(path, predictor, teacher_sha256, teacher_dtype="float32", **metadata):
     return _write_bundle(path, dict(
         format=PREDICTOR_FORMAT, model=_state(predictor),
         embed_dim=predictor.embed_dim, hidden_dim=predictor.hidden_dim,
-        use_actions=predictor.use_actions, teacher_sha256=teacher_sha256,
+        use_actions=predictor.use_actions, teacher_sha256=teacher_sha256, teacher_dtype=teacher_dtype,
         **metadata,
     ))
 
@@ -61,6 +61,7 @@ def export_stage2_adapter(path, adapter, *, predictor_bundle, selected_block,
         vjepa_dim=adapter.vjepa_dim, hidden_dim=adapter.hidden_dim,
         target_grid=adapter.target_grid, selected_block=selected_block,
         predictor=predictor_bundle, teacher_sha256=teacher_sha256,
+        teacher_dtype=predictor_bundle["teacher_dtype"],
         sigma_max=float(sigma_max), noise_sampling=noise_sampling, **metadata,
     ))
 
@@ -88,9 +89,12 @@ def load_stage2_distiller(teacher_bundle, adapter_bundle, device, dtype, *,
     bundle = torch.load(adapter_bundle, map_location="cpu", weights_only=False)
     if bundle["teacher_sha256"] != teacher_identity(teacher_bundle):
         raise ValueError("Frozen Teacher differs from the one used to fit the predictor")
-    teacher = load_frozen_visual_teacher(teacher_bundle, device=device, dtype=dtype)
+    teacher = load_frozen_visual_teacher(teacher_bundle, device=device, dtype=getattr(torch, bundle["teacher_dtype"]))
     adapter = load_stage2_adapter(adapter_bundle, device=device, dtype=dtype,
                                   dit_dim=dit_dim, selected_block=selected_block,
                                   noise_sampling=noise_sampling, freeze=True)
     predictor = load_predictor(bundle["predictor"], device=device)
-    return TemporalSemanticDistillation(teacher, adapter, predictor, bundle["sigma_max"]).freeze_adapter()
+    model = TemporalSemanticDistillation(teacher, adapter, predictor, bundle["sigma_max"]).freeze_adapter()
+    model.teacher_dtype = bundle["teacher_dtype"]
+    model.teacher_sha256 = bundle["teacher_sha256"]
+    return model

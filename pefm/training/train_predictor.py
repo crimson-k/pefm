@@ -18,7 +18,7 @@ from .train_adapter import loader, _move
 
 @torch.no_grad()
 def cache_targets(args):
-    teacher = load_frozen_visual_teacher(args.teacher_bundle, device=args.device, dtype=torch.float32)
+    teacher = load_frozen_visual_teacher(args.teacher_bundle, device=args.device, dtype=getattr(torch, args.teacher_dtype))
     identity = teacher_identity(args.teacher_bundle)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -27,10 +27,13 @@ def cache_targets(args):
             batch = _move(raw["teacher_batch"], args.device)
             tokens = teacher.vjepa_adapter(batch["rgb"], batch["group_ids"])
             grid = align_row_major_tokens(tokens, teacher.rgb_grid, teacher.aligned_grid)
-            embed = teacher.token_aggregator(grid.flatten(2, 4)).cpu()
+            embed = teacher.token_aggregator(grid.flatten(2, 4).contiguous()).cpu()
             payload = {"embed": embed, "action_segments": batch["action_segments"].cpu(),
                        "eef": batch["eef"].cpu(), "task": raw["task"],
-                       "teacher_sha256": identity}
+                       "teacher_sha256": identity, "teacher_dtype": args.teacher_dtype,
+                       "sample_index": raw["sample_index"],
+                       "source_video": raw["source_video"],
+                       "frame_indices": raw["frame_indices"]}
             path = output / f"sample_{index:06d}.pt"
             torch.save(payload, path)
             manifest.write(json.dumps({"path": path.name}) + "\n")
@@ -144,6 +147,7 @@ def run_epoch(model, batches, cfg, optimizer, epoch, split, accelerator, stop=No
 def save_state(path, model, optimizer, cfg, epoch, **progress):
     """A resumable predictor checkpoint never contains visual or stochastic weights."""
     export_predictor(path, model, cfg.teacher_sha256, epoch=epoch,
+                     teacher_dtype=cfg.teacher_dtype,
                      horizon=int(cfg.horizon), seed=int(cfg.seed),
                      optimizer=optimizer.state_dict(),
                      config=OmegaConf.to_container(cfg, resolve=True), **progress)
@@ -156,6 +160,7 @@ def parse_args(argv=None):
     parser.add_argument("--train-manifest")
     parser.add_argument("--valid-manifest")
     parser.add_argument("--teacher-bundle")
+    parser.add_argument("--teacher-dtype", choices=("float32", "bfloat16"), default="float32")
     parser.add_argument("--output")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--epochs", type=int, default=30)
@@ -204,6 +209,8 @@ def main(argv=None):
     identity = train[0]["teacher_sha256"]
     if any(r["teacher_sha256"] != identity for r in train + valid):
         raise ValueError("All target caches must use the same frozen Teacher")
+    assert all(r["teacher_dtype"] == args.teacher_dtype and r["embed"].dtype == getattr(torch, args.teacher_dtype)
+               for r in train + valid), "Target cache precision differs from Phase A"
     cfg = OmegaConf.create(vars(args))
     cfg.teacher_sha256 = identity
     accelerator = Accelerator(cpu=args.device == "cpu")
@@ -266,6 +273,7 @@ def main(argv=None):
             save_state(output / "latest.pt", core, optimizer, cfg, epoch + 1)
             if improved:
                 export_predictor(output / "predictor_best.pt", core, identity,
+                                 teacher_dtype=args.teacher_dtype,
                                  epoch=epoch + 1, horizon=args.horizon, metrics=record,
                                  statistics=statistics, motion_probe=probe, seed=cfg.seed)
         accelerator.wait_for_everyone()
