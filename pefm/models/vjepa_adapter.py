@@ -101,3 +101,15 @@ class TokenAggregator(nn.Module):
         queries = self.queries.expand(b * time, -1, -1)
         pooled, _ = self.attn(queries, tokens, tokens, need_weights=False)
         return self.norm(pooled.mean(1)).reshape(b, time, -1)
+
+class TokenPooling(nn.Module):
+    """Average over view/spatial tokens and return [B,T,E]."""
+    def __init__(self, token_dim, embed_dim):
+        super().__init__()
+        self.proj = nn.Linear(token_dim, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, tokens):
+        tokens = tokens.mean(dim=2)
+        tokens = self.proj(tokens)
+        return self.norm(tokens)

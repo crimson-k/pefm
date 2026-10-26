@@ -23,20 +23,25 @@ def teacher_contract(cfg):
         "stoch", "deter", "hidden", "discrete", "img_layers", "obs_layers",
         "dyn_layers", "blocks", "act", "unimix_ratio", "initial",
     )
-    return {
+    aggregator = {
+        "type": "cross_attention",
+        "token_dim": 48,
+        "embed_dim": 512,
+        "num_heads": 4,
+        "num_queries": 4,
+    }
+    contract = {
         "contract_version": TEACHER_CONTRACT_VERSION,
         "state_space": "shared_rssm_v1",
         "categorical_shape": [int(rssm.stoch), int(rssm.discrete)],
-        "embed_size": 256,
-        "token_dim": 1408,
-        "token_aggregator": {
-            "token_dim": 1408,
-            "embed_dim": 256,
-            "num_heads": 4,
-            "num_queries": 4,
+        "embed_size": 512,
+        "token_dim": 48,
+        "token_aggregator": aggregator,
+        "interaction_heads": {
+            "hidden": 256, "relation": 3, "event": 8, "motion": 5,
+            "shared_prior_posterior": True,
+            "object_loss_reduction": "sum",
         },
-        "rgb_grid": [int(value) for value in cfg.get("rgb_grid", [15, 20])],
-        "aligned_grid": [int(value) for value in cfg.get("aligned_grid", [15, 20])],
         "rssm": {
             key: (float(getattr(rssm, key)) if key == "unimix_ratio"
                   else str(getattr(rssm, key)) if key in ("act", "initial")
@@ -46,8 +51,28 @@ def teacher_contract(cfg):
         "num_frames": NUM_FRAMES,
         "history_frames": HISTORY_FRAMES,
         "time_groups": 1 + (NUM_FRAMES - 1) // TIME_DIVISION_FACTOR,
-        "vjepa_encoder_frozen": True,
     }
+    contract.update(
+        observation="wan_vae_clean_latents",
+        vae_encoder_frozen=True,
+        semantic_target={
+            "type": "vjepa_spatial_mean", "dim": int(cfg.get("semantic_dim", 1408)),
+            "encoder_frozen": True,
+        },
+        vae={
+            "type": "WanVideoVAE38", "channels": 48,
+            "spatial_compression": 16, "temporal_compression": 4,
+            "rgb_size": [int(cfg.height), int(cfg.width)],
+            "resize_mode": str(cfg.resize_mode),
+        },
+    )
+    if cfg.get("reward_label_reduction") == "masked_or":
+        contract["interaction_heads"].update(
+            object_label_reduction="masked_or", object_loss_reduction="none",
+            relation_loss="bce_with_logits", event_loss="bce_with_logits",
+            motion_loss="bce_with_logits",
+        )
+    return contract
 
 
 def check_teacher_contract(checkpoint, cfg):
@@ -89,7 +114,7 @@ def export_frozen_evaluator(checkpoint_path, bundle_path):
 
 
 def load_frozen_evaluator(bundle_path, device, dtype):
-    """Load BWM's frozen evaluator while retaining gradients to its RGB input."""
+    """Load the evaluator while retaining gradients to its observation input."""
     bundle = torch.load(bundle_path, map_location="cpu", weights_only=False)
     if bundle.get("format") != FORMAT:
         raise ValueError(f"Unsupported PEFM bundle format: {bundle.get('format')!r}")

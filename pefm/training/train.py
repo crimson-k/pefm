@@ -1,4 +1,4 @@
-"""Train the V-JEPA RSSM teacher used by the later latent/Main branch."""
+"""Train RSSM from RGB encoded by the frozen BWM Wan2.2 VAE."""
 
 import argparse
 import json
@@ -8,6 +8,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 import torch
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from omegaconf import OmegaConf
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pefm.training.config.parser import merge_yaml_and_args
@@ -16,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
 from dataloader import (
     RawCobotAction, build_RGB_dataloader, relative_eef_actions,
 )
-from pefm.models import build_evaluator
+from pefm.models import build_evaluator, build_vjepa_target
 from pefm.export import (
     check_teacher_contract,
     export_frozen_evaluator,
@@ -33,6 +34,18 @@ HISTORY_FRAMES = 9
 TIME_DIVISION_FACTOR = 4
 
 
+@torch.no_grad()
+def encode_rgb_latents(vae, rgb):
+    """Use BWM's VAE normalization and stack camera views along latent height."""
+    b, views = rgb.shape[:2]
+    parameter = next(vae.parameters())
+    latents = vae.encode(rgb.flatten(0, 1).to(parameter), device=parameter.device)
+    _, channels, time, height, width = latents.shape
+    return latents.reshape(b, views, channels, time, height, width).permute(
+        0, 2, 3, 1, 4, 5,
+    ).reshape(b, channels, time, views * height, width)
+
+
 def loss_reset_for_teacher(batch):
     """Keep the RSSM rollout intact but supervise only future groups."""
     reset = batch["reset"].clone()
@@ -42,21 +55,21 @@ def loss_reset_for_teacher(batch):
     return reset
 
 
-def mask_teacher_losses(output, losses, reset):
+def mask_teacher_losses(output, losses, reset, target_embed=None):
     """Apply the future-only mask to the reconstruction term as well."""
     valid = (~reset).to(output["embed"])
-    target_embed = output["embed"].detach()
+    target_embed = output["embed"] if target_embed is None else target_embed
+    target_embed = target_embed.detach().to(output["posterior_reconstruction"])
     reconstruction_error = (
         output["posterior_reconstruction"] - target_embed
     ).square().mean(-1)
-    losses["posterior_reconstruction"] = (
+    reconstruction_loss = (
         reconstruction_error * valid
     ).sum() / valid.sum().clamp_min(1)
     losses["total"] = (
-        losses["posterior_reconstruction"]
-        + losses["prior_prediction"]
-        + losses["kl"]
+        losses["total"] - losses["posterior_reconstruction"] + reconstruction_loss
     )
+    losses["posterior_reconstruction"] = reconstruction_loss
     return losses
 
 
@@ -136,7 +149,10 @@ def make_loader(cfg, metadata_name, first_episode, last_episode, shuffle):
     assert indices, f"No episodes {first_episode}-{last_episode} in {metadata_path}"
     dataset = RoboTwinUnifiedDataset(
         base_path=cfg.dataset, metadata_path=str(metadata_path), sample_indices=indices,
-        main_data_operator=create_video_operator(base_path=cfg.dataset, num_frames=NUM_FRAMES),
+        main_data_operator=create_video_operator(
+            base_path=cfg.dataset, num_frames=NUM_FRAMES,
+            height=cfg.height, width=cfg.width, resize_mode=cfg.resize_mode,
+        ),
         special_operator_map={"action": RawCobotAction(
             base_path=cfg.dataset, stat=load_action_stats(f"{cfg.dataset}/stat.json"),
         )},
@@ -144,27 +160,47 @@ def make_loader(cfg, metadata_name, first_episode, last_episode, shuffle):
     return build_RGB_dataloader(
         dataset, TIME_DIVISION_FACTOR, cfg.batch_size, shuffle=shuffle, num_workers=cfg.workers,
         action_delta_stats=cfg.action_delta_stats,
+        reward_labels=cfg.get("reward_labels"),
     )
 
-def run_epoch(model, loader, cfg, optimizer, epoch, split, accelerator, stop=None):
+def run_epoch(model, loader, cfg, optimizer, epoch, split, accelerator, stop=None,
+              vae=None, semantic_target=None):
     training = optimizer is not None
     model.train(training)
     core = accelerator.unwrap_model(model)
     totals, count = {}, 0
     for batch_id, batch in enumerate(loader):
+        if "interaction_target" not in batch:
+            raise KeyError("RSSM training requires interaction_target [B,T,16] or [B,T,K,16] GT labels")
         batch = {key: value.to(cfg.device) if torch.is_tensor(value) else value for key, value in batch.items()}
+        if vae is not None:
+            batch["clean_latents"] = encode_rgb_latents(vae, batch["rgb"])
         if training: optimizer.zero_grad()
         with torch.set_grad_enabled(training):
             output = model(batch)
+            target_embed = (
+                semantic_target(batch["rgb"], batch["group_ids"])
+                if semantic_target is not None else None
+            )
             loss_reset = loss_reset_for_teacher(batch)
             losses = core.compute_loss(
                 output, loss_reset, cfg.model.kl_free,
                 cfg.model.loss_scales.dyn, cfg.model.loss_scales.rep,
+                target_embed=target_embed,
+                interaction_target=batch["interaction_target"],
+                interaction_mask=batch.get("interaction_mask"),
+                interaction_weights=cfg.model.loss_scales,
+                event_is_dual_arm=batch.get("event_is_dual_arm"),
+                interaction_is_multi_object=batch.get("interaction_is_multi_object"),
             )
-            losses = mask_teacher_losses(output, losses, loss_reset)
+            losses = mask_teacher_losses(output, losses, loss_reset, target_embed)
         grad_norm = 0.0
         if training:
             accelerator.backward(losses["total"])
+            if batch_id == 0 and accelerator.is_main_process:
+                gradients = [p.grad.detach().float().norm() for p in core.token_aggregator.parameters() if p.grad is not None]
+                aggregator_grad = float(torch.stack(gradients).norm()) if gradients else 0.0
+                print(f"[aggregator] epoch={epoch} grad_norm={aggregator_grad:.6f}", flush=True)
             grad_norm = float(accelerator.clip_grad_norm_(model.parameters(), cfg.max_grad_norm))
             optimizer.step()
         names = list(losses)
@@ -209,7 +245,7 @@ def save_checkpoint(output, model, optimizer, cfg, epoch):
         print(f"[checkpoint] frozen evaluator: {frozen}", flush=True)
 
 def main():
-    accelerator = Accelerator()
+    accelerator = Accelerator(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)])
     stop = GracefulExit(accelerator)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None, help="Path to a YAML config file. CLI args override YAML config.")
@@ -224,6 +260,12 @@ def main():
         "model": OmegaConf.merge(base, size, model_overrides),
     })
     cfg.model.rssm.initial = "zeros"
+    cfg.observation = "clean_latents"
+    cfg.semantic_dim = 1408
+    cfg.reward_label_reduction = "masked_or"
+    cfg.height = int(cfg.get("height", 192))
+    cfg.width = int(cfg.get("width", 256))
+    cfg.resize_mode = str(cfg.get("resize_mode", "crop"))
     resume = torch.load(cfg.resume, map_location="cpu", weights_only=False) if cfg.resume else None
     saved_action_delta_stats = (
         resume.get("config", {}).get("action_delta_stats") if resume else None
@@ -241,6 +283,7 @@ def main():
     if resume:
         saved = OmegaConf.create(resume["config"])
         saved.device, saved.epochs, saved.resume, saved.seed = cfg.device, cfg.epochs, cfg.resume, resume["seed"]
+        saved.output = cfg.output
         saved.init_checkpoint = None
         saved.checkpoint_every = cfg.checkpoint_every
         saved.model = OmegaConf.merge(saved.model, model_overrides)
@@ -257,17 +300,31 @@ def main():
     accelerator.wait_for_everyone()
     train_loader = make_loader(cfg, "metadata_train.jsonl", 0, 39, True)
     val_loader = make_loader(cfg, "metadata_test.jsonl", 40, 49, False)
-    model = build_evaluator(cfg, cfg.vjepa_checkpoint)
-    # The V-JEPA encoder defines the observation semantics.  It is always
-    # frozen; the RSSM checkpoint produced here is the teacher state space
-    # that a later latent/Main branch must reuse.
-    model.vjepa_adapter.encoder.requires_grad_(False)
+    from diffsynth.core import load_model
+    from diffsynth.models.wan_video_vae import WanVideoVAE38
+    from diffsynth.utils.state_dict_converters.wan_video_vae import WanVideoVAEStateDictConverter
+
+    vae = load_model(
+        WanVideoVAE38, cfg.vae_checkpoint, device=cfg.device,
+        torch_dtype=getattr(torch, cfg.get("vae_dtype", "bfloat16")),
+        state_dict_converter=WanVideoVAEStateDictConverter,
+    ).requires_grad_(False).eval()
+    semantic_target = build_vjepa_target(
+        cfg.vjepa_checkpoint, device=cfg.device,
+        dtype=getattr(torch, cfg.get("vjepa_dtype", "bfloat16")),
+    )
+    model = build_evaluator(cfg)
     if init_checkpoint:
         model.load_state_dict(init_checkpoint["model"], strict=True)
         del init_checkpoint
     for name in cfg.get("freeze", []):
         model.get_submodule(name).requires_grad_(False)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if accelerator.is_main_process:
+        print("[trainable] " + " ".join(
+            f"{name}={sum(p.numel() for p in module.parameters() if p.requires_grad)}"
+            for name, module in model.named_children()
+        ), flush=True)
     optimizer = torch.optim.AdamW(parameters, lr=cfg.lr, weight_decay=cfg.weight_decay)
     start_epoch = 0
     if resume:
@@ -278,14 +335,18 @@ def main():
         model, optimizer, train_loader, val_loader,
     )
     for epoch in range(start_epoch, cfg.epochs):
-        if epoch >= int(cfg.get("freeze_aggregator_epoch", cfg.epochs + 1)):
-            accelerator.unwrap_model(model).token_aggregator.requires_grad_(False)
-        train_losses = run_epoch(model, train_loader, cfg, optimizer, epoch, "train", accelerator, stop)
+        train_losses = run_epoch(
+            model, train_loader, cfg, optimizer, epoch, "train", accelerator,
+            stop=stop, vae=vae, semantic_target=semantic_target,
+        )
         if stop.requested:
             stop.save(output, model, optimizer, cfg, epoch, "train", save_state)
             break
         with torch.no_grad():
-            val_losses = run_epoch(model, val_loader, cfg, None, epoch, "val", accelerator, stop)
+            val_losses = run_epoch(
+                model, val_loader, cfg, None, epoch, "val", accelerator,
+                stop=stop, vae=vae, semantic_target=semantic_target,
+            )
         if stop.requested:
             stop.save(output, model, optimizer, cfg, epoch, "val", save_state)
             break

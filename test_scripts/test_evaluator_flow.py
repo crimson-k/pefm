@@ -1,26 +1,14 @@
 """Small CPU check for the encoder-to-RSSM evaluator path."""
 
-from pathlib import Path
-
 import torch
 import pytest
 from omegaconf import OmegaConf
-from src.vjepa2.src.models.vision_transformer import vit_tiny
 
 from pefm.models import (
-    DiTHiddenObservation,
-    RSSM,
-    TokenAggregator,
-    VJEPARSSMEvaluator,
-    VJEPAObservationAdapter,
+    build_evaluator,
 )
 from pefm.models.dit_hidden import SpatiallyAlignedAdapter
 from pefm.models.vjepa_adapter import align_row_major_tokens, row_major_token_grid
-
-
-DIT_HIDDEN_PATH = Path(
-    "/data1/fangxuebin/boundless-world-model/outputs/infer/sft_iter2000_pefm_base_6tasks/adjust_bottle/episode40_dit_block20_hidden.pt"
-)
 
 
 def make_rssm_config():
@@ -32,139 +20,43 @@ def make_rssm_config():
     return cfg
 
 
-def make_test_vjepa():
-    """Build a small real V-JEPA encoder for a fast end-to-end CPU test."""
-    return vit_tiny(
-        img_size=(256, 256),
-        num_frames=2,
-        use_rope=True,
-    )
-
-
-def print_prior_results(name, output):
-    """Print the categorical prior and posterior state for every RSSM step."""
-    prior = output["prior_logits"].detach()
-    posterior = output["posterior_logits"].detach()
-    for step in range(prior.shape[1]):
-        prior_state = prior[0, step].argmax(-1).tolist()
-        posterior_state = posterior[0, step].argmax(-1).tolist()
-        prediction_norm = output["prior_prediction"][0, step].detach().norm().item()
-        print(
-            f"[{name}] step={step:02d} "
-            f"prior_mean={prior[0, step].mean().item():+.6f} "
-            f"prior_prediction_norm={prediction_norm:.6f} "
-            f"prior_argmax={prior_state} "
-            f"posterior_argmax={posterior_state}",
-            flush=True,
-        )
-
-
-def assert_rssm_output(output, steps):
-    assert output["embed"].shape[:2] == (1, steps)
-    assert output["prior_logits"].shape == (1, steps, 32, 16)
-    assert output["posterior_logits"].shape == (1, steps, 32, 16)
-    assert output["prior_stoch"].shape == (1, steps, 32, 16)
-    assert output["posterior_stoch"].shape == (1, steps, 32, 16)
-    torch.testing.assert_close(
-        output["prior_stoch"].sum(-1), torch.ones(1, steps, 32), atol=1e-5, rtol=1e-5
-    )
-    torch.testing.assert_close(
-        output["posterior_stoch"].sum(-1), torch.ones(1, steps, 32), atol=1e-5, rtol=1e-5
-    )
-    assert output["prior_prediction"].shape == (1, steps, 256)
-    assert output["posterior_reconstruction"].shape == (1, steps, 256)
-    for value in output.values():
-        if torch.is_tensor(value):
-            assert torch.isfinite(value).all(), f"non-finite output: {value.shape}"
-
-
-def test_bwm_vjepa_rssm_flow():
-    torch.manual_seed(0)
-    cfg = make_rssm_config()
-
-    evaluator = VJEPARSSMEvaluator(
-        VJEPAObservationAdapter(make_test_vjepa()),
-        TokenAggregator(token_dim=192, embed_dim=256, num_heads=4),
-        RSSM(cfg.model.rssm, embed_size=256, act_dim=14),
-    )
-    # BWM uses 81 frames: 3 history groups (the first 9 frames) plus 18 future groups.
-    group_ids = torch.cat([
-        torch.zeros(1, dtype=torch.long),
-        torch.arange(1, 21, dtype=torch.long).repeat_interleave(4),
-    ]).view(1, -1)
-    batch = {
-        "rgb": torch.rand(1, 1, 3, 81, 480, 640) * 2 - 1,
-        "group_ids": group_ids,
-        "action_delta": torch.randn(1, 21, 14),
-        "reset": torch.tensor([[True] + [False] * 20]),
-    }
-    raw_tokens = evaluator.vjepa_adapter(batch["rgb"])
-    assert raw_tokens.shape == (1, 81, 1200, 192)
-    grouped_tokens = raw_tokens.new_zeros((1, 21, 1200, 192))
-    grouped_tokens.index_add_(1, group_ids[0], raw_tokens)
-    grouped_tokens /= torch.bincount(group_ids[0]).to(raw_tokens).view(1, -1, 1, 1)
-    assert grouped_tokens.shape == (1, 21, 1200, 192)
-    aligned_tokens = align_row_major_tokens(grouped_tokens)
-    assert aligned_tokens.shape == (1, 21, 1, 15, 20, 192)
+def test_spatial_grid_alignment():
     coordinates = torch.arange(1200, dtype=torch.float32).reshape(1, 1, 1200, 1)
-    coordinate_grid = row_major_token_grid(coordinates)
-    coordinate_aligned = align_row_major_tokens(coordinates)
-    assert coordinate_grid[0, 0, 0, 1, 0, 0] == 40
-    assert coordinate_aligned[0, 0, 0, 0, 0, 0] == 20.5
-
-    output = evaluator(batch)
-    assert output["visual_grid"].shape == (1, 21, 1, 15, 20, 192)
-    assert output["visual_tokens"].shape == (1, 21, 300, 192)
-    assert torch.allclose(output["visual_grid"], aligned_tokens)
-    assert_rssm_output(output, steps=21)
-    print_prior_results("rgb", output)
-    losses = evaluator.compute_loss(output, batch["reset"], cfg.model.kl_free,
-                                    cfg.model.loss_scales.dyn, cfg.model.loss_scales.rep)
-    assert set(losses) == {"posterior_reconstruction", "prior_prediction",
-                           "kl_dynamics", "kl_representation", "kl", "total"}
-    assert all(torch.isfinite(loss) for loss in losses.values())
-    losses["total"].backward()
-    assert next(evaluator.rssm._img_net.parameters()).grad is not None
-    assert next(evaluator.rssm._obs_net.parameters()).grad is not None
-    assert evaluator.token_aggregator.queries.grad is not None
-    assert all(parameter.grad is None for parameter in evaluator.vjepa_adapter.encoder.parameters())
+    grid = row_major_token_grid(coordinates)
+    aligned = align_row_major_tokens(coordinates)
+    assert grid.shape == (1, 1, 1, 30, 40, 1)
+    assert aligned.shape == (1, 1, 1, 15, 20, 1)
+    assert grid[0, 0, 0, 1, 0, 0] == 40
+    assert aligned[0, 0, 0, 0, 0, 0] == 20.5
 
 
-def test_dit_hidden_rssm_flow():
-    torch.manual_seed(0)
-    assert DIT_HIDDEN_PATH.is_file(), f"Missing DiT hidden fixture: {DIT_HIDDEN_PATH}"
-    hidden = torch.load(DIT_HIDDEN_PATH, map_location="cpu", weights_only=True)
-    assert hidden.shape == (1, 6300, 3072)
-
-    observation = DiTHiddenObservation(dit_dim=3072, token_dim=192, embed_dim=256)
-    grid = observation.project_grid(hidden, dit_grid=(21, 15, 20), valid_len=6300)
-    spatial = observation(hidden, dit_grid=(21, 15, 20), valid_len=6300)
-    assert grid.shape == (1, 21, 15, 20, 192)
-    assert spatial.shape == (1, 21, 1, 15, 20, 192)
-    dit_tokens = spatial.flatten(2, 4).contiguous()
-    token_aggregator = TokenAggregator(token_dim=192, embed_dim=256, num_heads=4)
-    embed = token_aggregator(dit_tokens)
-
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_clean_latent_rssm_flow(batch_size):
     cfg = make_rssm_config()
-    rssm = RSSM(cfg.model.rssm, embed_size=256, act_dim=14)
-    action = torch.randn(1, 21, 14)
-    reset = torch.zeros(1, 21, dtype=torch.bool)
+    cfg.device = "cpu"
+    evaluator = build_evaluator(cfg)
+    latents = torch.randn(batch_size, 48, 21, 12, 16, requires_grad=True)
+    reset = torch.zeros(batch_size, 21, dtype=torch.bool)
     reset[:, 0] = True
-    evaluator = VJEPARSSMEvaluator(
-        vjepa_adapter=torch.nn.Identity(),
-        token_aggregator=token_aggregator,
-        rssm=rssm,
+    output = evaluator({
+        "clean_latents": latents,
+        "action_delta": torch.randn(batch_size, 21, 14),
+        "reset": reset,
+    })
+    assert not hasattr(evaluator, "vjepa_adapter")
+    assert evaluator.token_aggregator.attn.kdim == 48
+    assert output["latent_tokens"].shape == (batch_size, 21, 192, 48)
+    assert output["embed"].shape == (batch_size, 21, 512)
+    assert output["posterior_reconstruction"].shape == (batch_size, 21, 1408)
+    assert output["posterior_logits"].shape == (batch_size, 21, 32, 16)
+    losses = evaluator.compute_loss(
+        output, reset, free_nats=0.0, target_embed=torch.randn(batch_size, 21, 1408),
     )
-    output = evaluator.forward_embeddings(embed, action, reset)
-    assert_rssm_output(output, steps=21)
-    print_prior_results("dit", output)
-    losses = evaluator.compute_loss(output, reset, free_nats=0.0)
-    assert all(torch.isfinite(loss) for loss in losses.values())
-
-    # The DiT observation projection participates in posterior inference.
-    output["posterior_logits"].square().mean().backward()
-    assert observation.proj[1].weight.grad is not None
-    assert token_aggregator.queries.grad is not None
+    losses["total"].backward()
+    assert torch.isfinite(latents.grad).all() and latents.grad.norm() > 0
+    assert evaluator.token_aggregator.attn.k_proj_weight.grad.norm() > 0
+    assert evaluator.token_aggregator.queries.grad.norm() > 0
+    assert next(evaluator.rssm._deter_net.parameters()).grad.norm() > 0
 
 
 def test_spatial_adapter_requires_explicit_view_layout():
@@ -180,6 +72,6 @@ def test_spatial_adapter_requires_explicit_view_layout():
 
 
 if __name__ == "__main__":
-    test_bwm_vjepa_rssm_flow()
-    test_dit_hidden_rssm_flow()
+    test_clean_latent_rssm_flow(batch_size=1)
+    test_spatial_grid_alignment()
     print("test passed")

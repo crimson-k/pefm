@@ -1,35 +1,13 @@
-"""Build the fixed Stage-1 V-JEPA--RSSM evaluator architecture."""
-
-import torch
-
-from src.vjepa2.src.models.vision_transformer import VisionTransformer
+"""Build the clean-latent -> TokenAggregator -> RSSM evaluator."""
 
 from .rssm_core import RSSM
-from .vjepa_adapter import TokenAggregator, VJEPAObservationAdapter
-from .vjepa_rssm import VJEPARSSMEvaluator
+from .vjepa_adapter import TokenAggregator
+from .vjepa_rssm import Evaluator
 
 
-def build_evaluator(cfg, pretrained_checkpoint=None):
-    encoder = VisionTransformer(
-        img_size=(256, 256), num_frames=81, embed_dim=1408, depth=40,
-        num_heads=22, mlp_ratio=48 / 11, use_silu=False, use_rope=True,
-        use_activation_checkpointing=True,
-    )
-    if pretrained_checkpoint:
-        checkpoint = torch.load(pretrained_checkpoint, map_location="cpu", weights_only=False)
-        clean = lambda state: {
-            key.replace("module.", "").replace("backbone.", ""): value
-            for key, value in state.items()
-        }
-        encoder.load_state_dict(clean(checkpoint["encoder"]), strict=True)
-        del checkpoint
-
-    rgb_grid = tuple(int(value) for value in cfg.get("rgb_grid", [15, 20]))
-    aligned_grid = tuple(int(value) for value in cfg.get("aligned_grid", rgb_grid))
-    return VJEPARSSMEvaluator(
-        VJEPAObservationAdapter(encoder),
-        TokenAggregator(token_dim=1408, embed_dim=256, num_heads=4),
-        RSSM(cfg.model.rssm, embed_size=256, act_dim=14),
-        rgb_grid=rgb_grid,
-        aligned_grid=aligned_grid,
+def build_evaluator(cfg):
+    return Evaluator(
+        token_aggregator=TokenAggregator(token_dim=48, embed_dim=512, num_heads=4),
+        rssm=RSSM(cfg.model.rssm, embed_size=512, act_dim=14),
+        target_dim=int(cfg.get("semantic_dim", 1408)),
     ).to(cfg.device)

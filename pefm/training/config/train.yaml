@@ -1,5 +1,11 @@
-dataset: "/data1/fangxuebin/boundless-world-model/converted_dataset_bwm_6tasks_320x240"
+dataset: "../boundless-world-model/converted_dataset_bwm_6tasks_320x240"
 vjepa_checkpoint: "/data1/fangxuebin/models/vjepa2/vjepa2-ac-vitg.pt"
+vjepa_dtype: "bfloat16"
+vae_checkpoint: "/data1/common_model/modelscope/Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+vae_dtype: "bfloat16"
+height: 192
+width: 256
+resize_mode: "crop"
 output: "outputs/evaluator/soft_6tasks_epoch_100"
 resume: null
 init_checkpoint: null
@@ -13,14 +19,19 @@ lr: 4e-5
 weight_decay: 0.01
 max_grad_norm: 0.5
 max_batches: 0
-freeze_aggregator_epoch: 10
 
 eval_mode: False
 
 rssm_model_size: "src/r2dreamer/configs/model/size12M.yaml"
 
-freeze:
-  - "vjepa_adapter.encoder"
+model:
+  loss_scales:
+    relation: 1.0
+    event: 1.0
+    motion: 1.0
+    interaction: 1.0
+
+freeze: []
   # - "token_aggregator"
   # - "rssm"
   # - "posterior_reconstruction_head"
