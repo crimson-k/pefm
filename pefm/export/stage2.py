@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from pefm.models import SpatiallyAlignedAdapter, TemporalSemanticDistillation
+from pefm.models import SpatiallyAlignedAdapter, LatentSemanticDistillation
 
 from .frozen import load_frozen_evaluator
 
@@ -187,27 +187,9 @@ def _teacher_metadata(path):
 
 def load_stage2_distiller(
     teacher_bundle,
-    adapter_bundle,
     device,
-    dtype,
-    *,
-    dit_dim=None,
-    selected_block=None,
-    noise_sampling=None,
+    dtype=torch.float32,
 ):
-    """Load the frozen Teacher and Adapter used by Phase C."""
-    teacher_contract = _teacher_metadata(teacher_bundle)
+    """第二阶段只加载冻结的 clean-latent evaluator，不需要 Adapter。"""
     teacher = load_frozen_evaluator(teacher_bundle, device=device, dtype=dtype)
-    adapter = load_stage2_adapter(
-        adapter_bundle,
-        device=device,
-        dtype=dtype,
-        dit_dim=dit_dim,
-        selected_block=selected_block,
-        teacher_contract=teacher_contract,
-        noise_sampling=noise_sampling,
-        freeze=True,
-    )
-    distiller = TemporalSemanticDistillation(teacher, adapter, history_groups=HISTORY_GROUPS)
-    distiller.freeze_adapter()
-    return distiller
+    return LatentSemanticDistillation(teacher, history_groups=HISTORY_GROUPS).eval()

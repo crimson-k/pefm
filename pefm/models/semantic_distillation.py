@@ -13,6 +13,51 @@ VALID_PRIOR_STEPS = 17
 TARGET_GRID = (15, 20)
 
 
+class LatentSemanticDistillation(nn.Module):
+    """让 GT VAE latent 和 DiT 恢复的 clean latent 共用冻结的 evaluator。"""
+
+    def __init__(self, teacher, history_groups=HISTORY_GROUPS):
+        super().__init__()
+        self.teacher = teacher.requires_grad_(False).eval()
+        self.history_groups = int(history_groups)
+        if self.history_groups != HISTORY_GROUPS:
+            raise ValueError(f"Stage 2 requires history_groups={HISTORY_GROUPS}")
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.teacher.eval()
+        return self
+
+    def forward(self, generated_latents, target_latents, actions, reset):
+        if generated_latents.shape != target_latents.shape:
+            raise ValueError(
+                "Recovered clean latents must match GT VAE latents exactly, got "
+                f"{tuple(generated_latents.shape)} and {tuple(target_latents.shape)}"
+            )
+        if target_latents.ndim != 5 or target_latents.shape[1:3] != (48, TIME_GROUPS):
+            raise ValueError(f"Expected clean latents [B,48,21,H,W], got {tuple(target_latents.shape)}")
+        batch = target_latents.shape[0]
+        if actions.shape != (batch, TIME_GROUPS, 14) or reset.shape != (batch, TIME_GROUPS):
+            raise ValueError("Expected actions [B,21,14] and reset [B,21]")
+        with torch.no_grad():
+            target = self.teacher.forward_latents(target_latents.detach(), actions, reset)
+        # 两支使用同一份 GT 历史，未来观测才来自 DiT；保留恢复 latent 的输入梯度。
+        latents = torch.cat((
+            target_latents[:, :, :self.history_groups].detach(),
+            generated_latents[:, :, self.history_groups:],
+        ), dim=2)
+        generated = self.teacher.forward_latents(latents, actions, reset)
+        start = self.history_groups + 1
+        prior = generated["prior_logits"][:, start:]
+        posterior = target["posterior_logits"][:, start:].detach()
+        if prior.shape != posterior.shape or prior.shape[1] != VALID_PRIOR_STEPS:
+            raise ValueError("Expected matching GT posterior and generated prior [B,17,S,K]")
+        return {
+            "teacher": target, "generated": generated,
+            "prior": {"gt_posterior": posterior, "generated_prior": prior},
+        }
+
+
 def categorical_kl(target_logits, student_logits):
     """Return KL(target || student), summed over the RSSM stochastic variables."""
     return dists.kl(target_logits.detach().float(), student_logits.float()).sum(-1)
@@ -59,6 +104,8 @@ class TemporalSemanticDistillation(nn.Module):
         teacher_token_dim = getattr(attention, "kdim", None)
         if teacher_token_dim is None and attention is not None:
             teacher_token_dim = getattr(attention, "embed_dim", None)
+        if teacher_token_dim is None and hasattr(aggregator, "proj"):
+            teacher_token_dim = aggregator.proj.in_features
         if teacher_token_dim is not None and int(adapter.vjepa_dim) != int(teacher_token_dim):
             raise ValueError(
                 f"Adapter vjepa_dim={adapter.vjepa_dim} does not match "

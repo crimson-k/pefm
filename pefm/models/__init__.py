@@ -2,6 +2,7 @@ from .factory import build_evaluator
 from .dit_hidden import DiTHiddenObservation, SpatiallyAlignedAdapter
 from .rssm_core import RSSM
 from .semantic_distillation import (
+    LatentSemanticDistillation,
     TemporalSemanticDistillation,
     categorical_kl,
     token_alignment_metrics,
@@ -21,5 +22,6 @@ __all__ = [
     "align_row_major_tokens", "row_major_token_grid", "build_evaluator", "DiTHiddenObservation",
     "VJEPASemanticTarget", "build_vjepa_target",
     "TemporalSemanticDistillation", "categorical_kl", "token_alignment_metrics",
+    "LatentSemanticDistillation",
     "SpatiallyAlignedAdapter",
 ]

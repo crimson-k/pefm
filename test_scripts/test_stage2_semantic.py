@@ -17,7 +17,7 @@ from pefm.export import (
 from pefm.models import (
     SpatiallyAlignedAdapter,
     TemporalSemanticDistillation,
-    TokenAggregator,
+    TokenPooling,
     categorical_kl,
     token_alignment_metrics,
 )
@@ -28,7 +28,7 @@ class FakeTeacher(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.token_aggregator = TokenAggregator(token_dim=4, embed_dim=3, num_heads=1)
+        self.token_aggregator = TokenPooling(token_dim=4, embed_dim=3)
         self.state_head = nn.Linear(3, 6)
         self.action_head = nn.Linear(14, 6)
 
@@ -246,6 +246,7 @@ def test_teacher_state_and_action_acceptance():
 
 def teacher_config():
     return OmegaConf.create({
+        "height": 192, "width": 256, "resize_mode": "crop",
         "model": {
             "rssm": {
                 "stoch": 32, "deter": 2048, "hidden": 256, "discrete": 16,
@@ -267,3 +268,23 @@ def test_teacher_contract_rejects_old_or_incompatible_checkpoint():
     incompatible["rssm"]["deter"] += 1
     with pytest.raises(ValueError, match="Teacher contract mismatch"):
         check_teacher_contract({"semantic_teacher": incompatible}, cfg)
+    incompatible = copy.deepcopy(contract)
+    incompatible["interaction_heads"]["event"] = 4
+    with pytest.raises(ValueError, match="Teacher contract mismatch for interaction_heads"):
+        check_teacher_contract({"semantic_teacher": incompatible}, cfg)
+    incompatible = copy.deepcopy(contract)
+    incompatible["interaction_heads"]["motion"] = 6
+    with pytest.raises(ValueError, match="Teacher contract mismatch for interaction_heads"):
+        check_teacher_contract({"semantic_teacher": incompatible}, cfg)
+
+
+def test_or_multihot_contract_distinguishes_previous_training_semantics():
+    cfg = teacher_config()
+    previous = teacher_contract(cfg)
+    cfg.reward_label_reduction = "masked_or"
+    current = teacher_contract(cfg)
+    assert current["interaction_heads"]["object_label_reduction"] == "masked_or"
+    assert current["interaction_heads"]["relation_loss"] == "bce_with_logits"
+    check_teacher_contract({"semantic_teacher": current}, cfg)
+    with pytest.raises(ValueError, match="Teacher contract mismatch for interaction_heads"):
+        check_teacher_contract({"semantic_teacher": previous}, cfg)
