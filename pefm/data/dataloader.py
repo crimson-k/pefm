@@ -75,14 +75,24 @@ def normalize_action_delta(action_delta, stats):
     return torch.where(span > 1e-6, normalized, action_delta.clamp(-1.0, 1.0))
 
 
+def merge_object_labels(target, mask):
+    """沿物体轴 OR 合并 [...,K,16]；有确定正例即为 1，全体确定才可为 0。"""
+    mask = mask.to(device=target.device, dtype=torch.bool)
+    if (((target != 0) & (target != 1)) & mask).any():
+        raise ValueError("Valid interaction labels must be binary; mask unknown labels")
+    positive = ((target == 1) & mask).any(dim=-2)
+    return positive.to(dtype=target.dtype), positive | mask.all(dim=-2)
+
+
 class EvaluatorDataset(Dataset):
     """Convert one BWM sample into aligned RGB and grouped EEF tensors."""
 
     def __init__(self, bwm_dataset: Dataset, time_division_factor: int = 4,
-                 action_delta_stats=None):
+                 action_delta_stats=None, reward_labels=None):
         self.bwm_dataset = bwm_dataset
         self.time_division_factor = time_division_factor
         self.action_delta_stats = action_delta_stats
+        self.reward_labels = reward_labels
 
     def __len__(self):
         return len(self.bwm_dataset)
@@ -101,11 +111,12 @@ class EvaluatorDataset(Dataset):
         endpoints = torch.cat((torch.zeros(1, dtype=torch.long),
                                torch.arange(self.time_division_factor, rgb.shape[2], self.time_division_factor)))
         grouped_eef = eef[endpoints]
-        frame_indices = sample.get("frame_indices", range(rgb.shape[2]))
+        start_frame = int(sample.get("start_frame", 0))
+        frame_indices = sample.get("frame_indices", range(start_frame, start_frame + rgb.shape[2]))
         action_delta = normalize_action_delta(
             relative_eef_actions(grouped_eef), self.action_delta_stats,
         )
-        return {
+        result = {
             "sample_id": sample.get("sample_id", index),
             "task": sample.get("task", ""),
             "episode": int(sample.get("episode_index", -1)),
@@ -117,12 +128,52 @@ class EvaluatorDataset(Dataset):
             "group_ids": group_ids,
             "reset": torch.arange(int(group_ids[-1]) + 1) == 0,
         }
+        if self.reward_labels is not None:
+            from pathlib import Path
+            import numpy as np
+
+            episode = int(sample.get("source_episode_index", sample["episode_index"]))
+            key = f"{sample['split']}_{sample['task']}_{episode:06d}"
+            source_frames = torch.as_tensor(frame_indices, dtype=torch.long)[endpoints].numpy()
+            with np.load(Path(self.reward_labels) / f"{key}.npz", allow_pickle=False) as labels:
+                if not np.array_equal(labels["frame_index"], np.arange(len(labels["frame_index"]))):
+                    raise ValueError(f"Reward source must contain all original frames: {key}")
+                target = torch.from_numpy(labels["interaction_target"][source_frames])
+                mask = torch.from_numpy(labels["interaction_mask"][source_frames])
+            # 汉堡、薯条先合并为同一份 multi-hot，再对共享预测计算一次损失。
+            sample["interaction_is_multi_object"] = target.shape[1] > 1
+            sample["interaction_target"], sample["interaction_mask"] = merge_object_labels(target, mask)
+        if "interaction_target" in sample:
+            target = torch.as_tensor(sample["interaction_target"], dtype=torch.float32)
+            mask = torch.as_tensor(
+                sample.get("interaction_mask", torch.ones_like(target, dtype=torch.bool)),
+                dtype=torch.bool,
+            )
+            expected = (int(group_ids[-1]) + 1, 16)
+            if target.shape != expected or mask.shape != expected:
+                raise ValueError(f"Expected grouped interaction_target/mask {expected}, got {target.shape}/{mask.shape}")
+            # 元数据可以为整段指定一个布尔值，也可以逐时间组标记双臂事件。
+            dual_arm = torch.as_tensor(sample.get("event_is_dual_arm", False), dtype=torch.bool)
+            if dual_arm.ndim == 0:
+                dual_arm = dual_arm.expand(expected[0])
+            if dual_arm.shape != (expected[0],):
+                raise ValueError(f"Expected event_is_dual_arm scalar or shape {(expected[0],)}")
+            multi_object = torch.as_tensor(sample.get("interaction_is_multi_object", False), dtype=torch.bool)
+            if multi_object.ndim == 0:
+                multi_object = multi_object.expand(expected[0])
+            if multi_object.shape != (expected[0],):
+                raise ValueError(f"Expected interaction_is_multi_object scalar or shape {(expected[0],)}")
+            result.update(
+                interaction_target=target, interaction_mask=mask, event_is_dual_arm=dual_arm,
+                interaction_is_multi_object=multi_object,
+            )
+        return result
 
 
 def build_RGB_dataloader(bwm_dataset, time_division_factor, batch_size=4, shuffle=True,
-                         num_workers=4, action_delta_stats=None):
+                         num_workers=4, action_delta_stats=None, reward_labels=None):
     return DataLoader(
-        EvaluatorDataset(bwm_dataset, time_division_factor, action_delta_stats),
+        EvaluatorDataset(bwm_dataset, time_division_factor, action_delta_stats, reward_labels),
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
