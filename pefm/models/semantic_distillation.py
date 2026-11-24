@@ -34,11 +34,14 @@ class LatentSemanticDistillation(nn.Module):
                 "Recovered clean latents must match GT VAE latents exactly, got "
                 f"{tuple(generated_latents.shape)} and {tuple(target_latents.shape)}"
             )
-        if target_latents.ndim != 5 or target_latents.shape[1:3] != (48, TIME_GROUPS):
-            raise ValueError(f"Expected clean latents [B,48,21,H,W], got {tuple(target_latents.shape)}")
-        batch = target_latents.shape[0]
-        if actions.shape != (batch, TIME_GROUPS, 14) or reset.shape != (batch, TIME_GROUPS):
-            raise ValueError("Expected actions [B,21,14] and reset [B,21]")
+        if target_latents.ndim != 5 or target_latents.shape[1] != 48:
+            raise ValueError(f"Expected clean latents [B,48,T,H,W], got {tuple(target_latents.shape)}")
+        batch, _, groups, _, _ = target_latents.shape
+        start = self.history_groups + 1
+        if groups <= start:
+            raise ValueError("Clean latents must include future prior transitions after history")
+        if actions.shape != (batch, groups, 14) or reset.shape != (batch, groups):
+            raise ValueError(f"Expected actions [B,{groups},14] and reset [B,{groups}]")
         with torch.no_grad():
             target = self.teacher.forward_latents(target_latents.detach(), actions, reset)
         # 两支使用同一份 GT 历史，未来观测才来自 DiT；保留恢复 latent 的输入梯度。
@@ -47,11 +50,10 @@ class LatentSemanticDistillation(nn.Module):
             generated_latents[:, :, self.history_groups:],
         ), dim=2)
         generated = self.teacher.forward_latents(latents, actions, reset)
-        start = self.history_groups + 1
         prior = generated["prior_logits"][:, start:]
         posterior = target["posterior_logits"][:, start:].detach()
-        if prior.shape != posterior.shape or prior.shape[1] != VALID_PRIOR_STEPS:
-            raise ValueError("Expected matching GT posterior and generated prior [B,17,S,K]")
+        if prior.shape != posterior.shape or prior.shape[1] != groups - start:
+            raise ValueError(f"Expected matching GT posterior and generated prior [B,{groups - start},S,K]")
         return {
             "teacher": target, "generated": generated,
             "prior": {"gt_posterior": posterior, "generated_prior": prior},
