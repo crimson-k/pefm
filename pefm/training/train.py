@@ -12,6 +12,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 from omegaconf import OmegaConf
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pefm.training.config.parser import merge_yaml_and_args
+from pefm.training.early_stopping import initial_state, update as update_early_stopping
 from pefm.utils.graceful_exit import GracefulExit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
 from dataloader import (
@@ -233,9 +234,9 @@ def save_state(path, model, optimizer, cfg, epoch, **progress):
     torch.save(state, temporary)
     os.replace(temporary, path)
 
-def save_checkpoint(output, model, optimizer, cfg, epoch):
+def save_checkpoint(output, model, optimizer, cfg, epoch, **progress):
     latest = output / "latest.pt"
-    save_state(latest, model, optimizer, cfg, epoch)
+    save_state(latest, model, optimizer, cfg, epoch, **progress)
     numbered = output / f"epoch_{epoch:04d}.pt"
     if numbered.exists():
         numbered.unlink()
@@ -243,6 +244,11 @@ def save_checkpoint(output, model, optimizer, cfg, epoch):
     if epoch == cfg.epochs:
         frozen = export_frozen_evaluator(numbered, output / "frozen_evaluator.pt")
         print(f"[checkpoint] frozen evaluator: {frozen}", flush=True)
+    keep_every = cfg.get("checkpoint_keep_every", 0)
+    if keep_every:
+        for checkpoint in output.glob("epoch_*.pt"):
+            if int(checkpoint.stem.split("_")[-1]) % keep_every:
+                checkpoint.unlink()
 
 def main():
     accelerator = Accelerator(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)])
@@ -286,6 +292,9 @@ def main():
         saved.output = cfg.output
         saved.init_checkpoint = None
         saved.checkpoint_every = cfg.checkpoint_every
+        for key in ("early_stopping", "save_best", "checkpoint_keep_every"):
+            if key in cfg:
+                saved[key] = cfg[key]
         saved.model = OmegaConf.merge(saved.model, model_overrides)
         saved.action_delta_stats = cfg.action_delta_stats
         cfg = saved
@@ -331,6 +340,16 @@ def main():
         model.load_state_dict(resume["model"])
         optimizer.load_state_dict(resume["optimizer"])
         start_epoch = int(resume["epoch"])
+    control = cfg.get("early_stopping")
+    early_state = None
+    if control:
+        assert control.check_every > 0 and control.patience >= control.check_every
+        assert 0 < control.min_relative_improvement < 1
+        early_state = (resume or {}).get("early_stopping") or initial_state(
+            control.baseline, start_epoch,
+        )
+        if cfg.get("save_best"):
+            assert (output / "best.pt").exists(), "Seed best.pt with the selected resume checkpoint"
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader,
     )
@@ -350,11 +369,49 @@ def main():
         if stop.requested:
             stop.save(output, model, optimizer, cfg, epoch, "val", save_state)
             break
+        completed = epoch + 1
+        improved = False
+        if early_state is not None:
+            improved = update_early_stopping(
+                early_state, val_losses["total"], completed,
+                check_every=control.check_every, patience=control.patience,
+                min_relative_improvement=control.min_relative_improvement,
+            )
+        should_stop = early_state is not None and early_state["stop"]
         if accelerator.is_main_process:
             print(f"[epoch] {epoch} train={train_losses} val={val_losses}", flush=True)
-            completed = epoch + 1
-            if completed % cfg.checkpoint_every == 0 or completed == cfg.epochs:
-                save_checkpoint(output, accelerator.unwrap_model(model), optimizer, cfg, completed)
+            core = accelerator.unwrap_model(model)
+            if improved and cfg.get("save_best"):
+                save_state(output / "best.pt", core, optimizer, cfg, completed, early_stopping=early_state)
+            if completed % cfg.checkpoint_every == 0 or completed == cfg.epochs or should_stop:
+                save_checkpoint(output, core, optimizer, cfg, completed, early_stopping=early_state)
+            if early_state is not None:
+                status = {
+                    "epoch": completed, "max_epochs": cfg.epochs,
+                    "train": train_losses, "validation": val_losses,
+                    "early_stopping": dict(early_state),
+                }
+                with (output / "loss_monitor.jsonl").open("a") as file:
+                    file.write(json.dumps(status) + "\n")
+                temporary = output / "monitor_status.json.tmp"
+                temporary.write_text(json.dumps(status, indent=2) + "\n")
+                os.replace(temporary, output / "monitor_status.json")
+                print(f"[early_stopping] epoch={completed} state={early_state}", flush=True)
+        accelerator.wait_for_everyone()
+        if should_stop:
+            break
+    if early_state is not None and not stop.requested:
+        if accelerator.is_main_process:
+            if completed != cfg.epochs:
+                export_frozen_evaluator(output / "latest.pt", output / "frozen_evaluator.pt")
+            best_bundle = export_frozen_evaluator(output / "best.pt", output / "frozen_best_evaluator.pt")
+            summary = {
+                "completed_epoch": completed, "max_epochs": cfg.epochs,
+                "reason": "early_stopping" if early_state["stop"] else "max_epochs",
+                "early_stopping": early_state, "best_bundle": str(best_bundle),
+                "final_train": train_losses, "final_validation": val_losses,
+            }
+            (output / "training_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         accelerator.wait_for_everyone()
     accelerator.end_training()
 if __name__ == "__main__":
